@@ -3,6 +3,7 @@ import os
 import sys
 from loguru import logger
 from app.config import config
+from app.services import user_settings
 from webui.components import basic_settings, video_settings, audio_settings, subtitle_settings, script_settings, \
     system_settings
 # from webui.utils import cache, file_utils
@@ -114,6 +115,7 @@ def init_global_state():
         st.session_state['video_clip_json'] = []
     if 'video_plot' not in st.session_state:
         st.session_state['video_plot'] = ''
+    user_settings.apply_user_settings_to_config(st.session_state)
     if 'ui_language' not in st.session_state:
         st.session_state['ui_language'] = config.ui.get("language", utils.get_system_locale())
     # 移除subclip_videos初始化 - 现在使用统一裁剪策略
@@ -137,7 +139,7 @@ def render_generate_button():
         import time
         import uuid
 
-        config.save_config()
+        user_settings.save_runtime_settings(st.session_state)
 
         # 移除task_id检查 - 现在使用统一裁剪策略，不再需要预裁剪
         # 直接检查必要的文件是否存在

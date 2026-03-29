@@ -6,6 +6,7 @@ from app.config import config
 from app.utils import utils
 from loguru import logger
 from app.services.llm.unified_service import UnifiedLLMService
+from app.services import user_settings
 
 # 需要用户手动填写 Base URL 的 OpenAI 兼容网关及其默认接口
 OPENAI_COMPATIBLE_GATEWAY_BASE_URLS = {
@@ -13,7 +14,23 @@ OPENAI_COMPATIBLE_GATEWAY_BASE_URLS = {
     "openrouter": "https://openrouter.ai/api/v1",
     "moonshot": "https://api.moonshot.cn/v1",
     "gemini(openai)": "",
+    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
 }
+
+
+def normalize_litellm_model_name(selected_provider: str, model_name: str, base_url: str = "") -> str:
+    """Normalize provider/model for providers that need LiteLLM aliases.
+
+    qwen provider in the UI maps to dashscope for Aliyun Bailian / DashScope.
+    Existing working huggingface-based workarounds remain untouched.
+    """
+    provider = (selected_provider or "").strip().lower()
+    model = (model_name or "").strip()
+    if not provider or not model:
+        return ""
+    if provider == "qwen":
+        return f"dashscope/{model}"
+    return f"{provider}/{model}"
 
 
 def build_base_url_help(provider: str, model_type: str) -> tuple[str, bool, str]:
@@ -124,6 +141,7 @@ def show_config_validation_errors(errors: list):
 
 def render_basic_settings(tr):
     """渲染基础设置面板"""
+    user_settings.apply_user_settings_to_config(st.session_state)
     with st.expander(tr("Basic Settings"), expanded=False):
         config_panels = st.columns(3)
         left_config_panel = config_panels[0]
@@ -564,7 +582,7 @@ def render_vision_llm_settings(tr):
 
     # 定义支持的 provider 列表
     LITELLM_PROVIDERS = [
-        "openai", "gemini", "deepseek", "qwen", "siliconflow", "moonshot", 
+        "openai", "gemini", "deepseek", "qwen", "dashscope", "siliconflow", "moonshot", 
         "anthropic", "azure", "ollama", "vertex_ai", "mistral", "codestral", 
         "volcengine", "groq", "cohere", "together_ai", "fireworks_ai", 
         "openrouter", "replicate", "huggingface", "xai", "deepgram", "vllm", 
@@ -593,14 +611,11 @@ def render_vision_llm_settings(tr):
                  "常用示例:\n"
                  "• gemini-2.0-flash-lite\n"
                  "• gpt-4o\n"
-                 "• qwen-vl-max\n"
+                 "• qwen3.5-plus （通义建议走 qwen/dashscope）\n"
                  "• Qwen/Qwen2.5-VL-32B-Instruct (SiliconFlow)\n\n"
                  "支持 100+ providers，详见: https://docs.litellm.ai/docs/providers",
             key="vision_model_input"
         )
-
-    # 组合完整的模型名称
-    st_vision_model_name = f"{selected_provider}/{model_name_input}" if selected_provider and model_name_input else ""
 
     st_vision_api_key = st.text_input(
         tr("Vision API Key"),
@@ -626,6 +641,9 @@ def render_vision_llm_settings(tr):
     if vision_base_required and not st_vision_base_url:
         info_example = vision_placeholder or "https://your-openai-compatible-endpoint/v1"
         st.info(f"请在上方填写 OpenAI 兼容网关地址，例如：{info_example}")
+
+    # 组合完整的模型名称
+    st_vision_model_name = normalize_litellm_model_name(selected_provider, model_name_input, st_vision_base_url)
 
     # 添加测试连接按钮
     if st.button(tr("Test Connection"), key="test_vision_connection"):
@@ -697,7 +715,7 @@ def render_vision_llm_settings(tr):
     # 保存配置
     if config_changed and not validation_errors:
         try:
-            config.save_config()
+            user_settings.save_runtime_settings(st.session_state)
             # 清除缓存，确保下次使用新配置
             UnifiedLLMService.clear_cache()
             if st_vision_api_key or st_vision_base_url or st_vision_model_name:
@@ -836,7 +854,7 @@ def render_text_llm_settings(tr):
 
     # 定义支持的 provider 列表
     LITELLM_PROVIDERS = [
-        "openai", "gemini", "deepseek", "qwen", "siliconflow", "moonshot", 
+        "openai", "gemini", "deepseek", "qwen", "dashscope", "siliconflow", "moonshot", 
         "anthropic", "azure", "ollama", "vertex_ai", "mistral", "codestral", 
         "volcengine", "groq", "cohere", "together_ai", "fireworks_ai", 
         "openrouter", "replicate", "huggingface", "xai", "deepgram", "vllm", 
@@ -866,13 +884,11 @@ def render_text_llm_settings(tr):
                  "• deepseek-chat\n"
                  "• gpt-4o\n"
                  "• gemini-2.0-flash\n"
+                 "• qwen-plus （通义建议走 qwen/dashscope）\n"
                  "• deepseek-ai/DeepSeek-R1 (SiliconFlow)\n\n"
                  "支持 100+ providers，详见: https://docs.litellm.ai/docs/providers",
             key="text_model_input"
         )
-
-    # 组合完整的模型名称
-    st_text_model_name = f"{selected_provider}/{model_name_input}" if selected_provider and model_name_input else ""
 
     st_text_api_key = st.text_input(
         tr("Text API Key"),
@@ -900,6 +916,9 @@ def render_text_llm_settings(tr):
     if text_base_required and not st_text_base_url:
         info_example = text_placeholder or "https://your-openai-compatible-endpoint/v1"
         st.info(f"请在上方填写 OpenAI 兼容网关地址，例如：{info_example}")
+
+    # 组合完整的模型名称
+    st_text_model_name = normalize_litellm_model_name(selected_provider, model_name_input, st_text_base_url)
 
     # 添加测试连接按钮
     if st.button(tr("Test Connection"), key="test_text_connection"):
@@ -970,7 +989,7 @@ def render_text_llm_settings(tr):
     # 保存配置
     if text_config_changed and not text_validation_errors:
         try:
-            config.save_config()
+            user_settings.save_runtime_settings(st.session_state)
             # 清除缓存，确保下次使用新配置
             UnifiedLLMService.clear_cache()
             if st_text_api_key or st_text_base_url or st_text_model_name:

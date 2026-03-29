@@ -1,219 +1,251 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-'''
-@Project: NarratoAI
-@File   : 生成介绍文案
-@Author : Viccy同学
-@Date   : 2025/5/8 上午11:33 
-'''
-
 import json
 import os
 import traceback
-import asyncio
+from typing import Dict, List
+
 from openai import OpenAI
 from loguru import logger
 
-# 导入新的LLM服务模块 - 确保提供商被注册
-import app.services.llm  # 这会触发提供商注册
+# 兼容旧链路
+import app.services.llm  # noqa: F401
 from app.services.llm.migration_adapter import generate_narration as generate_narration_new
-# 导入新的提示词管理系统
 from app.services.prompts import PromptManager
+from app.services.script_fallback import ensure_script_shape
+
+
+SYSTEM_ROLE = "你是一名专业的影视解说编辑，要求先忠于事实，再保证表达有吸引力。"
 
 
 def parse_frame_analysis_to_markdown(json_file_path):
-    """
-    解析视频帧分析JSON文件并转换为Markdown格式
-    
-    :param json_file_path: JSON文件路径
-    :return: Markdown格式的字符串
-    """
-    # 检查文件是否存在
     if not os.path.exists(json_file_path):
         return f"错误: 文件 {json_file_path} 不存在"
-    
     try:
-        # 读取JSON文件
         with open(json_file_path, 'r', encoding='utf-8') as file:
             data = json.load(file)
-        
-        # 初始化Markdown字符串
         markdown = ""
-        
-        # 获取总结和帧观察数据
         summaries = data.get('overall_activity_summaries', [])
         frame_observations = data.get('frame_observations', [])
-        
-        # 按批次组织数据
         batch_frames = {}
         for frame in frame_observations:
             batch_index = frame.get('batch_index')
-            if batch_index not in batch_frames:
-                batch_frames[batch_index] = []
-            batch_frames[batch_index].append(frame)
-        
-        # 生成Markdown内容
+            batch_frames.setdefault(batch_index, []).append(frame)
         for i, summary in enumerate(summaries, 1):
             batch_index = summary.get('batch_index')
             time_range = summary.get('time_range', '')
             batch_summary = summary.get('summary', '')
-            
             markdown += f"## 片段 {i}\n"
             markdown += f"- 时间范围：{time_range}\n"
-            
-            # 添加片段描述
-            markdown += f"- 片段描述：{batch_summary}\n" if batch_summary else f"- 片段描述：\n"
-            
+            markdown += f"- 片段描述：{batch_summary}\n"
             markdown += "- 详细描述：\n"
-            
-            # 添加该批次的帧观察详情
-            frames = batch_frames.get(batch_index, [])
-            for frame in frames:
-                timestamp = frame.get('timestamp', '')
-                observation = frame.get('observation', '')
-                
-                # 直接使用原始文本，不进行分割
-                markdown += f"  - {timestamp}: {observation}\n" if observation else f"  - {timestamp}: \n"
-            
+            for frame in batch_frames.get(batch_index, []):
+                markdown += f"  - {frame.get('timestamp', '')}: {frame.get('observation', '')}\n"
             markdown += "\n"
-        
         return markdown
-    
-    except Exception as e:
+    except Exception:
         return f"处理JSON文件时出错: {traceback.format_exc()}"
 
 
-def generate_narration(markdown_content, api_key, base_url, model):
-    """
-    调用大模型API根据视频帧分析的Markdown内容生成解说文案 - 已重构为使用新的LLM服务架构
+def scene_evidence_to_markdown(scene_evidence: List[Dict]) -> str:
+    lines = []
+    for idx, scene in enumerate(scene_evidence or [], start=1):
+        lines.append(f"## Scene {idx}")
+        lines.append(f"- scene_id: {scene.get('scene_id')}")
+        lines.append(f"- timestamp: {scene.get('timestamp')}")
+        lines.append(f"- subtitle_text: {scene.get('subtitle_text', '')}")
+        lines.append(f"- visual_summary: {scene.get('visual_summary', '')}")
+        frames = scene.get('frame_paths', [])
+        if frames:
+            lines.append(f"- frame_count: {len(frames)}")
+        lines.append("")
+    return "\n".join(lines)
 
-    :param markdown_content: Markdown格式的视频帧分析内容
-    :param api_key: API密钥
-    :param base_url: API基础URL
-    :param model: 使用的模型名称
-    :return: 生成的解说文案
-    """
+
+FACT_PROMPT = """
+请阅读下面的视频片段证据包，先做事实抽取，不要直接写花哨文案。
+
+要求：
+1. 每个 scene 输出一条 facts 记录。
+2. 仅基于字幕和画面证据，不要脑补不存在的细节。
+3. 输出 JSON，格式如下：
+{
+  "items": [
+    {
+      "scene_id": "scene_001",
+      "timestamp": "00:00:00,000-00:00:03,000",
+      "picture": "用一句话概括这一段画面与动作",
+      "fact": "用一句话概括这一段真实发生了什么"
+    }
+  ]
+}
+
+证据包：
+{scene_markdown}
+"""
+
+
+POLISH_PROMPT = """
+你将收到一组事实版视频解说片段，请把它们改写成适合短视频解说的文案。
+
+要求：
+1. 保留原时间戳，不新增事实。
+2. narration 要简洁、准确、有一点吸引力，但不要浮夸。
+3. picture 保留为画面概括。
+4. 输出 JSON，格式如下：
+{
+  "items": [
+    {
+      "_id": 1,
+      "timestamp": "00:00:00,000-00:00:03,000",
+      "picture": "...",
+      "narration": "..."
+    }
+  ]
+}
+
+事实版数据：
+{fact_json}
+"""
+
+
+def generate_narration(markdown_content, api_key, base_url, model):
     try:
-        # 优先使用新的LLM服务架构
         logger.info("使用新的LLM服务架构生成解说文案")
         result = generate_narration_new(markdown_content, api_key, base_url, model)
         return result
-
     except Exception as e:
         logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
-
-        # 回退到旧的实现以确保兼容性
         return _generate_narration_legacy(markdown_content, api_key, base_url, model)
 
 
-def _generate_narration_legacy(markdown_content, api_key, base_url, model):
-    """
-    旧的解说文案生成实现 - 保留作为备用方案
-
-    :param markdown_content: Markdown格式的视频帧分析内容
-    :param api_key: API密钥
-    :param base_url: API基础URL
-    :param model: 使用的模型名称
-    :return: 生成的解说文案
-    """
+def generate_narration_from_scene_evidence(scene_evidence: List[Dict], api_key: str, base_url: str, model: str) -> List[Dict]:
+    if not scene_evidence:
+        return []
     try:
-        # 使用新的提示词管理系统构建提示词
+        client = OpenAI(api_key=api_key, base_url=base_url)
+        scene_markdown = scene_evidence_to_markdown(scene_evidence)
+        facts_response = _chat_json(
+            client=client,
+            model=model,
+            prompt=FACT_PROMPT.format(scene_markdown=scene_markdown),
+        )
+        fact_items = facts_response.get("items", []) if isinstance(facts_response, dict) else []
+        if not fact_items:
+            logger.warning("事实版生成为空，回退到本地兜底")
+            return _fallback_from_scene_evidence(scene_evidence)
+
+        fact_json = json.dumps(fact_items, ensure_ascii=False, indent=2)
+        polish_response = _chat_json(
+            client=client,
+            model=model,
+            prompt=POLISH_PROMPT.format(fact_json=fact_json),
+        )
+        polished_items = polish_response.get("items", []) if isinstance(polish_response, dict) else []
+        if not polished_items:
+            polished_items = _facts_to_items(fact_items)
+        for idx, item in enumerate(polished_items, start=1):
+            item.setdefault("_id", idx)
+            item.setdefault("OST", 2)
+        return ensure_script_shape(polished_items)
+    except Exception as e:
+        logger.error(f"基于字幕证据生成解说失败: {e}")
+        return _fallback_from_scene_evidence(scene_evidence)
+
+
+def _generate_narration_legacy(markdown_content, api_key, base_url, model):
+    try:
         prompt = PromptManager.get_prompt(
             category="documentary",
             name="narration_generation",
-            parameters={
-                "video_frame_description": markdown_content
-            }
+            parameters={"video_frame_description": markdown_content},
         )
-
-
-
-
-
-
-
-        # 使用OpenAI SDK初始化客户端
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url
-        )
-        
-        # 使用SDK发送请求
+        client = OpenAI(api_key=api_key, base_url=base_url)
         if model not in ["deepseek-reasoner"]:
-            # deepseek-reasoner 不支持 json 输出
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "你是一名专业的短视频解说文案撰写专家。"},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": SYSTEM_ROLE},
+                    {"role": "user", "content": prompt},
                 ],
-                temperature=1.5,
+                temperature=0.9,
                 response_format={"type": "json_object"},
             )
-            # 提取生成的文案
-            if response.choices and len(response.choices) > 0:
-                narration_script = response.choices[0].message.content
-                # 打印消耗的tokens
+            if response.choices:
                 logger.debug(f"消耗的tokens: {response.usage.total_tokens}")
-                return narration_script
-            else:
-                return "生成解说文案失败: 未获取到有效响应"
-        else:
-            # 不支持 json 输出，需要多一步处理 ```json ``` 的步骤
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "你是一名专业的短视频解说文案撰写专家。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=1.5,
-            )
-            # 提取生成的文案
-            if response.choices and len(response.choices) > 0:
-                narration_script = response.choices[0].message.content
-                # 打印消耗的tokens
-                logger.debug(f"文案消耗的tokens: {response.usage.total_tokens}")
-                # 清理 narration_script 字符串前后的 ```json ``` 字符串
-                narration_script = narration_script.replace("```json", "").replace("```", "")
-                return narration_script
-            else:
-                return "生成解说文案失败: 未获取到有效响应"
-    
-    except Exception as e:
+                return response.choices[0].message.content
+            return "生成解说文案失败: 未获取到有效响应"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SYSTEM_ROLE},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.9,
+        )
+        if response.choices:
+            narration_script = response.choices[0].message.content
+            logger.debug(f"文案消耗的tokens: {response.usage.total_tokens}")
+            return narration_script.replace("```json", "").replace("```", "")
+        return "生成解说文案失败: 未获取到有效响应"
+    except Exception:
         return f"调用API生成解说文案时出错: {traceback.format_exc()}"
 
 
-if __name__ == '__main__':
-    text_provider = 'openai'
-    text_api_key = "sk-xxx"
-    text_model = "deepseek-reasoner"
-    text_base_url = "https://api.deepseek.com"
-    video_frame_description_path = "/Users/apple/Desktop/home/NarratoAI/storage/temp/analysis/frame_analysis_20250508_1139.json"
+def _chat_json(client: OpenAI, model: str, prompt: str) -> Dict:
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM_ROLE},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+        response_format={"type": "json_object"},
+    )
+    content = response.choices[0].message.content if response.choices else "{}"
+    logger.debug(f"LLM tokens: {getattr(response, 'usage', None)}")
+    return _parse_json_text(content)
 
-    # 测试新的JSON文件
-    test_file_path = "/Users/apple/Desktop/home/NarratoAI/storage/temp/analysis/frame_analysis_20250508_2258.json"
-    markdown_output = parse_frame_analysis_to_markdown(test_file_path)
-    # print(markdown_output)
-    
-    # 输出到文件以便检查格式
-    output_file = "/Users/apple/Desktop/home/NarratoAI/storage/temp/家里家外1-5.md"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(markdown_output)
-    # print(f"\n已将Markdown输出保存到: {output_file}")
-    
-    # # 生成解说文案
-    # narration = generate_narration(
-    #     markdown_output,
-    #     text_api_key,
-    #     base_url=text_base_url,
-    #     model=text_model
-    # )
-    #
-    # # 保存解说文案
-    # print(narration)
-    # print(type(narration))
-    # narration_file = "/Users/apple/Desktop/home/NarratoAI/storage/temp/final_narration_script.json"
-    # with open(narration_file, 'w', encoding='utf-8') as f:
-    #     f.write(narration)
-    # print(f"\n已将解说文案保存到: {narration_file}")
+
+def _parse_json_text(content: str) -> Dict:
+    text = (content or "").strip()
+    if "```json" in text:
+        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in text:
+        text = text.split("```", 1)[1].split("```", 1)[0].strip()
+    return json.loads(text)
+
+
+def _fallback_from_scene_evidence(scene_evidence: List[Dict]) -> List[Dict]:
+    items = []
+    for idx, scene in enumerate(scene_evidence or [], start=1):
+        subtitle_text = (scene.get("subtitle_text") or "").strip()
+        visual_summary = (scene.get("visual_summary") or "").strip()
+        picture = visual_summary or subtitle_text or "画面出现新的信息点"
+        if subtitle_text:
+            narration = subtitle_text[:50]
+        else:
+            narration = visual_summary[:40] or "这一段的关键信息已经出现。"
+        items.append({
+            "_id": idx,
+            "timestamp": scene.get("timestamp"),
+            "picture": picture,
+            "narration": narration,
+            "OST": 2,
+        })
+    return ensure_script_shape(items)
+
+
+def _facts_to_items(fact_items: List[Dict]) -> List[Dict]:
+    items = []
+    for idx, item in enumerate(fact_items or [], start=1):
+        narration = item.get("fact") or item.get("picture") or "这一段发生了新的变化。"
+        items.append({
+            "_id": idx,
+            "timestamp": item.get("timestamp"),
+            "picture": item.get("picture", ""),
+            "narration": narration,
+            "OST": 2,
+        })
+    return items

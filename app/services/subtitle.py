@@ -4,7 +4,10 @@ import re
 import traceback
 from typing import Optional
 
-# from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+except Exception:
+    WhisperModel = None
 from timeit import default_timer as timer
 from loguru import logger
 import google.generativeai as genai
@@ -378,57 +381,53 @@ def create_with_gemini(audio_file: str, subtitle_file: str = "", api_key: Option
 
 
 def extract_audio_and_create_subtitle(video_file: str, subtitle_file: str = "") -> Optional[str]:
-    """
-    从视频文件中提取音频并生成字幕文件。
-
-    参数:
-    - video_file: MP4视频文件的路径
-    - subtitle_file: 输出字幕文件的路径（可选）。如果未提供，将根据视频文件名自动生成。
-
-    返回:
-    - str: 生成的字幕文件路径
-    - None: 如果处理过程中出现错误
-    """
+    """从视频文件中提取音频并生成字幕文件。"""
+    audio_file = ""
+    video = None
     try:
-        # 获取视频文件所在目录
         video_dir = os.path.dirname(video_file)
         video_name = os.path.splitext(os.path.basename(video_file))[0]
-        
-        # 设置音频文件路径
-        audio_file = os.path.join(video_dir, f"{video_name}_audio.wav")
-        
-        # 如果未指定字幕文件路径，则自动生成
+        audio_dir = utils.temp_dir("audio_extract")
+        os.makedirs(audio_dir, exist_ok=True)
+        audio_file = os.path.join(audio_dir, f"{video_name}_audio.wav")
+
         if not subtitle_file:
-            subtitle_file = os.path.join(video_dir, f"{video_name}.srt")
-        
+            subtitle_dir = utils.temp_dir("subtitles")
+            os.makedirs(subtitle_dir, exist_ok=True)
+            subtitle_file = os.path.join(subtitle_dir, f"{video_name}.srt")
+
         logger.info(f"开始从视频提取音频: {video_file}")
-        
-        # 加载视频文件
         video = VideoFileClip(video_file)
-        
-        # 提取音频并保存为WAV格式
+        if video.audio is None:
+            logger.error("视频文件不包含音频轨道，无法自动生成字幕")
+            return None
+
         logger.info(f"正在提取音频到: {audio_file}")
-        video.audio.write_audiofile(audio_file, codec='pcm_s16le')
-        
-        # 关闭视频文件
-        video.close()
-        
+        video.audio.write_audiofile(audio_file, codec='pcm_s16le', logger=None)
         logger.info("音频提取完成，开始生成字幕")
-        
-        # 使用create函数生成字幕
-        create("/Users/apple/Desktop/WhisperX-zhuanlu/1_qyn2-2_Vocals.wav", subtitle_file)
-        
-        # 删除临时音频文件
-        if os.path.exists(audio_file):
-            os.remove(audio_file)
-            logger.info("已清理临时音频文件")
-        
-        return subtitle_file
-        
+
+        create(audio_file, subtitle_file)
+        if os.path.exists(subtitle_file):
+            logger.info(f"字幕生成完成: {subtitle_file}")
+            return subtitle_file
+        logger.error("字幕生成失败，未输出字幕文件")
+        return None
     except Exception as e:
         logger.error(f"处理视频文件时出错: {str(e)}")
         logger.error(traceback.format_exc())
         return None
+    finally:
+        try:
+            if video is not None:
+                video.close()
+        except Exception:
+            pass
+        try:
+            if audio_file and os.path.exists(audio_file):
+                os.remove(audio_file)
+                logger.info("已清理临时音频文件")
+        except Exception as cleanup_error:
+            logger.warning(f"清理临时音频文件失败: {cleanup_error}")
 
 
 if __name__ == "__main__":
@@ -460,3 +459,8 @@ if __name__ == "__main__":
     # #
     # # if gemini_subtitle_file:
     # #     print(f"Gemini生成的字幕文件: {gemini_subtitle_file}")
+
+
+def create_from_video(video_file: str, subtitle_file: str = "") -> Optional[str]:
+    """兼容别名，供新的字幕流水线调用。"""
+    return extract_audio_and_create_subtitle(video_file, subtitle_file)

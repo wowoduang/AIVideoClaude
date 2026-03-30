@@ -36,12 +36,31 @@ def _candidate_model_dirs(requested_model_size: str) -> List[str]:
     return [os.path.join(utils.root_dir(), "app", "models", name) for name in candidates]
 
 
+_MODEL_FILES = ("model.bin", "model.safetensors")
+
+
+def _is_valid_model_dir(path: str) -> bool:
+    """Check if directory contains a CTranslate2 model file (model.bin or model.safetensors)."""
+    return any(os.path.isfile(os.path.join(path, f)) for f in _MODEL_FILES)
+
+
 def _resolve_model_path() -> Tuple[Optional[str], List[str]]:
     searched = _candidate_model_dirs(config.whisper.get("model_size", model_size))
-    for path in searched:
-        if os.path.isdir(path) and os.path.isfile(os.path.join(path, "model.bin")):
-            return path, searched
-    return None, searched
+    searched_abs = [os.path.abspath(p) for p in searched]
+    for path in searched_abs:
+        if os.path.isdir(path):
+            if _is_valid_model_dir(path):
+                return path, searched_abs
+            else:
+                try:
+                    contents = os.listdir(path)
+                except OSError:
+                    contents = []
+                logger.warning(
+                    f"模型目录存在但未找到模型文件 ({', '.join(_MODEL_FILES)}): {path}\n"
+                    f"目录内容: {contents}"
+                )
+    return None, searched_abs
 
 
 def _load_model() -> bool:

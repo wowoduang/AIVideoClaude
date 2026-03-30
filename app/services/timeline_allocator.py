@@ -1,5 +1,7 @@
 from typing import Dict, List
 
+from loguru import logger
+
 
 def estimate_char_budget(duration: float, chars_per_second: float = 4.0, reserve_ratio: float = 0.85) -> int:
     return max(8, int(duration * chars_per_second * reserve_ratio))
@@ -30,6 +32,10 @@ def apply_timeline_budget(items: List[Dict]) -> List[Dict]:
             duration = max(0.5, float(item["end"]) - float(item["start"]))
         budget = estimate_char_budget(duration)
         new_item["char_budget"] = budget
-        new_item["narration"] = trim_text_to_budget(item.get("narration", ""), budget)
+        original_narration = item.get("narration", "")
+        trimmed_narration = trim_text_to_budget(original_narration, budget)
+        if len(trimmed_narration) < len(original_narration):
+            logger.warning(f"后置截断触发: scene_id={item.get('scene_id', 'unknown')}, 预算={budget}, 原文长度={len(original_narration)}, 截断后长度={len(trimmed_narration)}")
+        new_item["narration"] = trimmed_narration
         result.append(new_item)
     return result

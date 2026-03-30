@@ -21,7 +21,7 @@ from webui.tools.base import create_vision_analyzer
 
 
 def generate_script_docu(params):
-    """字幕优先的视频脚本生成：字幕/ASR 做主理解，代表帧补画面。"""
+    """字幕优先的视频脚本生成：字幕/ASR 做主理解，视觉补充可选。"""
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -35,50 +35,70 @@ def generate_script_docu(params):
                 st.error("请先选择视频文件")
                 return
 
-            update_progress(5, "正在准备关键帧...")
-            keyframe_files = _prepare_keyframes(params.video_origin_path)
-            if not keyframe_files:
-                raise Exception("未提取到任何关键帧文件")
-
-            update_progress(20, "正在准备字幕/转写...")
+            update_progress(10, "正在准备字幕/转写...")
             subtitle_result = build_subtitle_segments(
                 video_path=params.video_origin_path,
                 explicit_subtitle_path=resolve_explicit_subtitle_path(params, st.session_state),
             )
             subtitle_segments = subtitle_result.get("segments", [])
-            if subtitle_segments:
-                st.info(f"✅ 使用字幕主链，共 {len(subtitle_segments)} 段 ({subtitle_result.get('source')})")
-            else:
-                st.warning("⚠️ 未获得字幕，将退回视觉主导模式（成本更高，准确性较低）")
+            subtitle_success = bool(subtitle_segments)
+            enable_visual_supplement = bool(
+                st.session_state.get("enable_visual_supplement", config.app.get("enable_visual_supplement", False))
+            )
 
-            update_progress(35, "正在构建场景段...")
-            if subtitle_segments:
+            if subtitle_success:
+                st.success(f"✅ 已获得字幕，共 {len(subtitle_segments)} 段，进入字幕优先模式")
+                if enable_visual_supplement:
+                    st.info("🖼️ 已启用视觉补充：将在字幕主理解基础上分析少量代表帧")
+                else:
+                    st.info("💰 已关闭视觉补充：将只基于字幕生成脚本（更省 token）")
+            else:
+                error = subtitle_result.get("error") or "auto_subtitle_failed"
+                st.warning(f"⚠️ 未获得字幕（{error}），将退回视觉主导模式（成本更高，准确性较低）")
+
+            update_progress(30, "正在构建场景段...")
+            if subtitle_success:
                 scenes = build_scenes_from_subtitles(subtitle_segments)
             else:
+                update_progress(20, "正在准备关键帧...")
+                keyframe_files = _prepare_keyframes(params.video_origin_path)
+                if not keyframe_files:
+                    raise Exception("未提取到任何关键帧文件")
                 fallback_interval = st.session_state.get("frame_interval_input") or config.frames.get("skip_seconds", 3)
                 scenes = build_fallback_scenes_from_keyframes(keyframe_files[:8], fallback_interval=fallback_interval)
 
-            frames_per_scene = int(st.session_state.get("frames_per_scene") or 2)
-            frame_records = select_representative_frames(scenes, keyframe_files, frames_per_scene=frames_per_scene)
-            max_total_frames = int(st.session_state.get('max_total_frames') or 24)
-            frame_records, budget_meta = cap_frame_records(frame_records, max_total_frames=max_total_frames)
-            selected_frame_paths = [record["frame_path"] for record in frame_records]
-            if not selected_frame_paths:
-                selected_frame_paths = keyframe_files[: min(len(keyframe_files), 3)]
-                frame_records = [{"scene_id": scenes[0]["scene_id"], "frame_path": p, "timestamp_seconds": 0.0} for p in selected_frame_paths]
+            frame_records = []
+            visual_observations = {}
+            results = []
+            budget_meta = {"estimated_tokens": 0, "estimated_cost_cny": 0.0, "capped": 0, "original": 0}
 
-            update_progress(50, f"正在分析代表帧，共 {len(selected_frame_paths)} 张（预计输入token≈{budget_meta.get('estimated_tokens',0)}）...")
-            results = _analyze_selected_frames(selected_frame_paths)
-            visual_observations = parse_visual_analysis_results(results, frame_records)
+            if (not subtitle_success) or enable_visual_supplement:
+                update_progress(45, "正在准备代表帧...")
+                keyframe_files = _prepare_keyframes(params.video_origin_path)
+                if not keyframe_files:
+                    raise Exception("未提取到任何关键帧文件")
 
-            update_progress(65, "正在融合字幕与画面证据...")
+                frames_per_scene = 1 if subtitle_success else int(st.session_state.get("frames_per_scene") or 2)
+                frame_records = select_representative_frames(scenes, keyframe_files, frames_per_scene=frames_per_scene)
+                max_total_frames = 12 if subtitle_success else int(st.session_state.get('max_total_frames') or 24)
+                frame_records, budget_meta = cap_frame_records(frame_records, max_total_frames=max_total_frames)
+                selected_frame_paths = [record["frame_path"] for record in frame_records]
+                if selected_frame_paths:
+                    update_progress(60, f"正在分析代表帧，共 {len(selected_frame_paths)} 张（预计输入token≈{budget_meta.get('estimated_tokens',0)}）...")
+                    results = _analyze_selected_frames(selected_frame_paths)
+                    visual_observations = parse_visual_analysis_results(results, frame_records)
+            else:
+                st.caption("当前未启用视觉补充：跳过代表帧分析")
+
+            update_progress(75, "正在融合字幕与画面证据...")
             scene_evidence = fuse_scene_evidence(scenes, frame_records, visual_observations)
             for scene in scene_evidence:
                 scene['visual_budget_meta'] = budget_meta
+                scene['evidence_mode'] = 'subtitle+visual' if (subtitle_success and enable_visual_supplement) else ('subtitle_only' if subtitle_success else 'visual_only')
             analysis_json_path = _save_analysis(scene_evidence, results)
             logger.info(f"分析结果已保存到: {analysis_json_path}")
 
-            update_progress(80, "正在生成解说文案...")
+            update_progress(88, "正在生成解说文案...")
             text_provider = config.app.get('text_llm_provider', 'gemini').lower()
             text_api_key = config.app.get(f'text_{text_provider}_api_key')
             text_model = config.app.get(f'text_{text_provider}_model_name')
@@ -147,18 +167,14 @@ def _analyze_selected_frames(selected_frame_paths):
     asyncio.set_event_loop(loop)
     try:
         prompt = (
-            "你将收到一组按时间顺序排列的代表帧。请逐帧观察，并输出 JSON："
-            "{\"frame_observations\":[{\"frame_number\":1,\"observation\":\"...\"}],"
-            "\"overall_activity_summary\":\"...\"}。"
-            "请只返回JSON。"
+            '你将收到一组按时间顺序排列的代表帧。请逐帧观察，并输出 JSON：'
+            '{"frame_observations":[{"frame_number":1,"observation":"..."}],'
+            '"overall_activity_summary":"..."}。'
+            '请只返回JSON。'
         )
         vision_batch_size = int(st.session_state.get('vision_batch_size') or config.frames.get('vision_batch_size', 3))
         return loop.run_until_complete(
-            analyzer.analyze_images(
-                images=selected_frame_paths,
-                prompt=prompt,
-                batch_size=max(1, vision_batch_size),
-            )
+            analyzer.analyze_images(images=selected_frame_paths, prompt=prompt, batch_size=max(1, vision_batch_size))
         )
     finally:
         loop.close()
@@ -169,10 +185,7 @@ def _save_analysis(scene_evidence, raw_results):
     os.makedirs(analysis_dir, exist_ok=True)
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(analysis_dir, f"scene_evidence_{now}.json")
-    payload = {
-        "scene_evidence": scene_evidence,
-        "raw_results": raw_results,
-    }
+    payload = {"scene_evidence": scene_evidence, "raw_results": raw_results}
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     return path

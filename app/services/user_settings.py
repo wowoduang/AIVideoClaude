@@ -25,6 +25,7 @@ ALLOWED_APP_KEYS = {
     "voice_name",
     "voice_rate",
     "voice_pitch",
+    "enable_visual_supplement",
 }
 ALLOWED_UI_KEYS = {"language"}
 ALLOWED_PROXY_KEYS = {"enabled", "http", "https"}
@@ -35,6 +36,7 @@ SESSION_KEY_MAP = {
     "text_litellm_model_name": "text_litellm_model_name",
     "text_litellm_api_key": "text_litellm_api_key",
     "text_litellm_base_url": "text_litellm_base_url",
+    "enable_visual_supplement": "enable_visual_supplement",
     "ui_language": ("ui", "language"),
 }
 

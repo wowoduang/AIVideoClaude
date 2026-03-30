@@ -1,5 +1,14 @@
 """
 视频脚本生成pipeline，串联各个处理步骤
+
+⚠️ Legacy 标记：此模块为原有短剧管道实现，保留用于向后兼容。
+新版本请使用 webui/tools/generate_script_short.py 中的共享底座实现。
+
+两种模式对比：
+- Legacy 模式（本文件）：直接分析字幕 → 爆点提取 → 脚本合并
+- 新模式（共享底座）：字幕标准化 → 场景切分 → 证据融合 → 两阶段生成（短剧风格）
+
+切换方式：在 webui/tools/generate_script_short.py 中调用 generate_script_short_legacy()。
 """
 from typing import Any, Dict, Optional
 from loguru import logger

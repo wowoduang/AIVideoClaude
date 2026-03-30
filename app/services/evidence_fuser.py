@@ -2,6 +2,7 @@ from typing import Dict, List
 
 from loguru import logger
 from app.utils import utils
+from app.services.timeline_allocator import estimate_char_budget
 
 
 def parse_visual_analysis_results(results: List[Dict], selected_frames: List[Dict]) -> Dict[str, List[Dict]]:
@@ -43,6 +44,8 @@ def fuse_scene_evidence(scenes: List[Dict], frame_records: List[Dict], visual_ob
         frames = sorted(scene_frames.get(scene_id, []), key=lambda x: x["timestamp_seconds"])
         visuals = visual_observations.get(scene_id, [])
         visual_summary = " ".join([v.get("observation", "") for v in visuals[:3]]).strip()
+        duration = scene["end"] - scene["start"]
+        char_budget = estimate_char_budget(duration)
         evidence.append({
             "scene_id": scene_id,
             "start": scene["start"],
@@ -52,6 +55,7 @@ def fuse_scene_evidence(scenes: List[Dict], frame_records: List[Dict], visual_ob
             "subtitle_text": scene.get("subtitle_text", ""),
             "frame_paths": [f["frame_path"] for f in frames],
             "visual_summary": visual_summary,
+            "char_budget": char_budget,
         })
     logger.info(f"证据融合完成: {len(evidence)} 个 scene evidence")
     return evidence

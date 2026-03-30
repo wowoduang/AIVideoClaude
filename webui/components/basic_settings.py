@@ -712,6 +712,16 @@ def render_vision_llm_settings(tr):
     # 显示验证错误
     show_config_validation_errors(validation_errors)
 
+    enable_visual_supplement = st.checkbox(
+        '字幕成功时启用视觉补充（会增加成本）',
+        value=bool(st.session_state.get('enable_visual_supplement', config.app.get('enable_visual_supplement', False))),
+        help='开启后：在字幕主理解基础上，再分析少量代表帧补充动作/表情；关闭后：只基于字幕生成脚本，更省 token。',
+        key='enable_visual_supplement_checkbox'
+    )
+    config.app['enable_visual_supplement'] = enable_visual_supplement
+    st.session_state['enable_visual_supplement'] = enable_visual_supplement
+    config_changed = True
+
     # 保存配置
     if config_changed and not validation_errors:
         try:

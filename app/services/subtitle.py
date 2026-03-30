@@ -1,6 +1,7 @@
 import os
 import os.path
 import re
+import sys
 import traceback
 from typing import Optional, List, Tuple
 
@@ -25,6 +26,29 @@ model = None
 _model_identity = None
 
 
+def _base_dirs() -> List[str]:
+    """Return candidate base directories for locating app/models.
+
+    In a normal Python environment ``utils.root_dir()`` is sufficient.
+    When the application is compiled / packaged (e.g. PyInstaller),
+    ``__file__`` may resolve to a temporary extraction directory so we
+    also try the current working directory and the directory that holds
+    the running executable.
+    """
+    seen: set = set()
+    bases: List[str] = []
+    for raw in (
+        utils.root_dir(),
+        os.getcwd(),
+        os.path.dirname(os.path.abspath(sys.executable)),
+    ):
+        d = os.path.abspath(raw)
+        if d not in seen:
+            seen.add(d)
+            bases.append(d)
+    return bases
+
+
 def _candidate_model_dirs(requested_model_size: str) -> List[str]:
     requested = (requested_model_size or "").strip()
     candidates = []
@@ -33,7 +57,16 @@ def _candidate_model_dirs(requested_model_size: str) -> List[str]:
     for fallback in ["faster-whisper-large-v3", "faster-whisper-large-v2", "large-v3", "large-v2"]:
         if fallback not in candidates:
             candidates.append(fallback)
-    return [os.path.join(utils.root_dir(), "app", "models", name) for name in candidates]
+
+    dirs: List[str] = []
+    seen: set = set()
+    for base in _base_dirs():
+        for name in candidates:
+            p = os.path.abspath(os.path.join(base, "app", "models", name))
+            if p not in seen:
+                seen.add(p)
+                dirs.append(p)
+    return dirs
 
 
 _MODEL_FILES = ("model.bin", "model.safetensors")
@@ -46,11 +79,10 @@ def _is_valid_model_dir(path: str) -> bool:
 
 def _resolve_model_path() -> Tuple[Optional[str], List[str]]:
     searched = _candidate_model_dirs(config.whisper.get("model_size", model_size))
-    searched_abs = [os.path.abspath(p) for p in searched]
-    for path in searched_abs:
+    for path in searched:
         if os.path.isdir(path):
             if _is_valid_model_dir(path):
-                return path, searched_abs
+                return path, searched
             else:
                 try:
                     contents = os.listdir(path)
@@ -60,7 +92,7 @@ def _resolve_model_path() -> Tuple[Optional[str], List[str]]:
                     f"模型目录存在但未找到模型文件 ({', '.join(_MODEL_FILES)}): {path}\n"
                     f"目录内容: {contents}"
                 )
-    return None, searched_abs
+    return None, searched
 
 
 def _load_model() -> bool:
@@ -72,6 +104,7 @@ def _load_model() -> bool:
     model_path, searched = _resolve_model_path()
     if not model_path:
         searched_text = "\n".join([f"- {p}" for p in searched])
+        bases_text = "\n".join([f"- {d}" for d in _base_dirs()])
         logger.error(
             "请先下载 whisper 模型\n\n"
             "********************************************\n"
@@ -79,7 +112,12 @@ def _load_model() -> bool:
             "https://huggingface.co/guillaumekln/faster-whisper-large-v3\n"
             "或：\n"
             "https://huggingface.co/guillaumekln/faster-whisper-large-v2\n\n"
-            "存放路径示例：app/models/faster-whisper-large-v3\n"
+            "存放路径示例：app/models/faster-whisper-large-v3\n\n"
+            f"root_dir(): {utils.root_dir()}\n"
+            f"cwd: {os.getcwd()}\n"
+            f"executable: {sys.executable}\n\n"
+            "搜索基础目录：\n"
+            f"{bases_text}\n\n"
             "已搜索目录：\n"
             f"{searched_text}\n"
             "********************************************\n"

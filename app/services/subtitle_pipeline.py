@@ -4,7 +4,12 @@ from typing import Dict
 from loguru import logger
 
 from app.services import subtitle
-from app.services.subtitle_normalizer import dump_segments_to_srt, normalize_segments, parse_srt_file
+from app.services.subtitle_normalizer import (
+    dump_segments_to_srt,
+    normalize_segments,
+    parse_srt_file,
+    parse_subtitle_file,
+)
 from app.utils import utils
 
 
@@ -30,14 +35,28 @@ def resolve_explicit_subtitle_path(params=None, session_state=None) -> str:
     return ""
 
 
+def _detect_subtitle_source(subtitle_path: str) -> str:
+    """Detect the subtitle source label from the file extension."""
+    if not subtitle_path:
+        return "none"
+    ext = os.path.splitext(subtitle_path)[1].lower()
+    source_map = {
+        ".srt": "external_srt",
+        ".ass": "external_ass",
+        ".ssa": "external_ass",
+        ".vtt": "external_vtt",
+    }
+    return source_map.get(ext, "external_srt")
+
+
 def build_subtitle_segments(video_path: str, explicit_subtitle_path: str = "", regenerate: bool = False) -> Dict:
     subtitle_path = explicit_subtitle_path or ""
     source = "none"
     error = ""
 
     if subtitle_path and os.path.exists(subtitle_path):
-        source = "external_srt"
-        logger.info(f"使用外挂字幕: {subtitle_path}")
+        source = _detect_subtitle_source(subtitle_path)
+        logger.info(f"使用外挂字幕: {subtitle_path} (format={source})")
     else:
         subtitle_dir = utils.temp_dir("subtitles")
         os.makedirs(subtitle_dir, exist_ok=True)
@@ -50,11 +69,15 @@ def build_subtitle_segments(video_path: str, explicit_subtitle_path: str = "", r
                 error = "auto_subtitle_failed"
         source = "generated_srt" if os.path.exists(subtitle_path) else "none"
 
-    segments = parse_srt_file(subtitle_path) if subtitle_path and os.path.exists(subtitle_path) else []
+    # Use unified parser that auto-detects SRT/ASS/VTT
+    segments = parse_subtitle_file(subtitle_path) if subtitle_path and os.path.exists(subtitle_path) else []
     normalized = normalize_segments(segments)
-    if normalized and subtitle_path:
+
+    # For external SRT files, write back the normalized version
+    if normalized and subtitle_path and source == "external_srt":
         dump_segments_to_srt(normalized, subtitle_path)
-    if not normalized and not error and source != "external_srt":
+
+    if not normalized and not error and not source.startswith("external"):
         error = "empty_subtitle_segments"
     logger.info(f"字幕流水线完成: source={source}, segments={len(normalized)}")
     return {

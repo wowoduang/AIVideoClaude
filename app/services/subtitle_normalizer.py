@@ -10,6 +10,22 @@ SRT_TIME_RE = re.compile(
     r"(?P<eh>\d{2}):(?P<em>\d{2}):(?P<es>\d{2}),(?P<ems>\d{3})"
 )
 
+# ASS/SSA Dialogue line regex
+# Format: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+ASS_DIALOGUE_RE = re.compile(
+    r"Dialogue:\s*\d+,"
+    r"(?P<sh>\d+):(?P<sm>\d{2}):(?P<ss>\d{2})\.(?P<scs>\d{2}),"
+    r"(?P<eh>\d+):(?P<em>\d{2}):(?P<es>\d{2})\.(?P<ecs>\d{2}),"
+    r"[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,"
+    r"(?P<text>.+)"
+)
+
+# VTT timestamp regex (supports both . and , as ms separator)
+VTT_TIME_RE = re.compile(
+    r"(?P<sh>\d{2}):(?P<sm>\d{2}):(?P<ss>\d{2})[.,](?P<sms>\d{3})\s*-->\s*"
+    r"(?P<eh>\d{2}):(?P<em>\d{2}):(?P<es>\d{2})[.,](?P<ems>\d{3})"
+)
+
 
 def srt_time_to_seconds(value: str) -> float:
     h, m, rest = value.split(":")
@@ -66,6 +82,163 @@ def parse_srt_file(filename: str) -> List[Dict]:
             "source": "srt",
         })
     return segments
+
+
+def parse_ass_file(filename: str) -> List[Dict]:
+    """Parse ASS/SSA subtitle file into normalized segments.
+
+    Handles standard ASS Dialogue lines. Override/drawing tags
+    (e.g. {\\pos(...)}, {\\an8}) are stripped from the text.
+    """
+    if not filename or not os.path.isfile(filename):
+        return []
+
+    with open(filename, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    segments: List[Dict] = []
+    idx = 0
+    for line in text.splitlines():
+        match = ASS_DIALOGUE_RE.match(line.strip())
+        if not match:
+            continue
+
+        start = (
+            int(match.group("sh")) * 3600
+            + int(match.group("sm")) * 60
+            + int(match.group("ss"))
+            + int(match.group("scs")) / 100.0
+        )
+        end = (
+            int(match.group("eh")) * 3600
+            + int(match.group("em")) * 60
+            + int(match.group("es"))
+            + int(match.group("ecs")) / 100.0
+        )
+
+        raw_text = match.group("text")
+        # Strip ASS override tags like {\pos(320,50)}
+        raw_text = re.sub(r"\{[^}]*\}", "", raw_text)
+        # Replace \N and \n (ASS line breaks) with space
+        raw_text = raw_text.replace("\\N", " ").replace("\\n", " ")
+        raw_text = raw_text.strip()
+        if not raw_text:
+            continue
+
+        idx += 1
+        segments.append({
+            "seg_id": f"sub_{idx:04d}",
+            "start": start,
+            "end": max(end, start + 0.2),
+            "text": raw_text,
+            "source": "ass",
+        })
+    logger.info(f"ASS字幕解析完成: {len(segments)} 段")
+    return segments
+
+
+def parse_vtt_file(filename: str) -> List[Dict]:
+    """Parse WebVTT subtitle file into normalized segments.
+
+    Handles standard WebVTT cues. HTML tags (e.g. <b>, <i>) and
+    voice tags (e.g. <v Speaker>) are stripped.
+    """
+    if not filename or not os.path.isfile(filename):
+        return []
+
+    with open(filename, "r", encoding="utf-8") as f:
+        text = f.read().replace("\r\n", "\n")
+
+    # Remove WEBVTT header and any metadata blocks
+    # Split by double newlines to get cue blocks
+    blocks = re.split(r"\n\s*\n", text.strip())
+    segments: List[Dict] = []
+    idx = 0
+
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+
+        # Skip WEBVTT header block
+        if lines[0].startswith("WEBVTT"):
+            continue
+        # Skip NOTE blocks
+        if lines[0].startswith("NOTE"):
+            continue
+        # Skip STYLE blocks
+        if lines[0].startswith("STYLE"):
+            continue
+
+        # Find the timestamp line
+        time_line_idx = -1
+        for i, line in enumerate(lines):
+            if VTT_TIME_RE.search(line):
+                time_line_idx = i
+                break
+
+        if time_line_idx < 0:
+            continue
+
+        match = VTT_TIME_RE.search(lines[time_line_idx])
+        if not match:
+            continue
+
+        start = srt_time_to_seconds(
+            f"{match.group('sh')}:{match.group('sm')}:{match.group('ss')},{match.group('sms')}"
+        )
+        end = srt_time_to_seconds(
+            f"{match.group('eh')}:{match.group('em')}:{match.group('es')},{match.group('ems')}"
+        )
+
+        # Text is everything after the timestamp line
+        content_lines = lines[time_line_idx + 1:]
+        raw_text = " ".join(content_lines).strip()
+        # Strip HTML tags (e.g. <b>, </b>, <i>, <v Speaker>)
+        raw_text = re.sub(r"<[^>]+>", "", raw_text)
+        raw_text = raw_text.strip()
+        if not raw_text:
+            continue
+
+        idx += 1
+        segments.append({
+            "seg_id": f"sub_{idx:04d}",
+            "start": start,
+            "end": max(end, start + 0.2),
+            "text": raw_text,
+            "source": "vtt",
+        })
+    logger.info(f"VTT字幕解析完成: {len(segments)} 段")
+    return segments
+
+
+def parse_subtitle_file(filename: str) -> List[Dict]:
+    """Auto-detect subtitle format and parse into normalized segments.
+
+    Supports SRT, ASS/SSA, and WebVTT formats. Detection is based on
+    file extension with content-based fallback.
+    """
+    if not filename or not os.path.isfile(filename):
+        return []
+
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in (".ass", ".ssa"):
+        return parse_ass_file(filename)
+    elif ext == ".vtt":
+        return parse_vtt_file(filename)
+    elif ext == ".srt":
+        return parse_srt_file(filename)
+
+    # Fallback: try to detect format from content
+    with open(filename, "r", encoding="utf-8") as f:
+        head = f.read(512)
+
+    if "WEBVTT" in head:
+        return parse_vtt_file(filename)
+    if "[Script Info]" in head or "[V4+ Styles]" in head or "[V4 Styles]" in head:
+        return parse_ass_file(filename)
+    # Default to SRT
+    return parse_srt_file(filename)
 
 
 def _clean_text(text: str) -> str:

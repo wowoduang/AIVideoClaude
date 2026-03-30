@@ -330,7 +330,7 @@ def short_drama_summary(tr):
     
     subtitle_file = st.file_uploader(
         tr("上传字幕文件"),
-        type=["srt"],
+        type=["srt", "ass", "ssa", "vtt"],
         accept_multiple_files=False,
         key="subtitle_file_uploader"  # 添加唯一key
     )

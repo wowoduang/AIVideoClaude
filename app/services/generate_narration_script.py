@@ -58,6 +58,32 @@ def scene_evidence_to_markdown(scene_evidence: List[Dict]) -> str:
         lines.append(f"- subtitle_text: {scene.get('subtitle_text', '')}")
         lines.append(f"- visual_summary: {scene.get('visual_summary', '')}")
         lines.append(f"- evidence_mode: {scene.get('evidence_mode', 'subtitle_first')}")
+
+        # M7 enriched fields
+        entities = scene.get("entities", [])
+        if entities:
+            lines.append(f"- entities: {', '.join(entities)}")
+        emotion = scene.get("emotion_hint", "")
+        if emotion and emotion != "neutral":
+            lines.append(f"- emotion_hint: {emotion}")
+
+        # M8 plot understanding
+        plot_role = scene.get("plot_role", "")
+        if plot_role:
+            lines.append(f"- plot_role: {plot_role}")
+        attraction = scene.get("attraction_level", "")
+        if attraction:
+            lines.append(f"- attraction_level: {attraction}")
+
+        # Context window
+        ctx = scene.get("context_window", {})
+        prev_ctx = ctx.get("prev", [])
+        next_ctx = ctx.get("next", [])
+        if prev_ctx:
+            lines.append(f"- context_prev: {' | '.join(prev_ctx)}")
+        if next_ctx:
+            lines.append(f"- context_next: {' | '.join(next_ctx)}")
+
         frames = scene.get("frame_paths", [])
         if frames:
             lines.append(f"- frame_count: {len(frames)}")

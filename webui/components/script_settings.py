@@ -9,6 +9,7 @@ from loguru import logger
 from app.config import config
 from app.models.schema import VideoClipParams
 from app.services.subtitle_text import decode_subtitle_bytes
+from app.services.timeline_allocator import fit_check
 from app.utils import utils, check_script
 from webui.tools.generate_script_docu import generate_script_docu
 from webui.tools.generate_script_short import generate_script_short
@@ -435,16 +436,167 @@ def render_script_buttons(tr, params):
         else:
             load_script(tr, script_path)
 
+    # ── Evidence preview panel (subtitle-first pipeline) ────────
+    _render_evidence_preview(tr)
+
     # 视频脚本编辑区
-    video_clip_json_details = st.text_area(
-        tr("Video Script"),
-        value=json.dumps(st.session_state.get('video_clip_json', []), indent=2, ensure_ascii=False),
-        height=500
-    )
+    video_clip_json_details = _render_script_editor(tr)
 
     # 操作按钮行 - 合并格式检查和保存功能
     if st.button(tr("Save Script"), key="save_script", use_container_width=True):
         save_script_with_validation(tr, video_clip_json_details)
+
+
+def _render_evidence_preview(tr):
+    """Render the evidence preview panel with cost estimation and global summary.
+
+    Only shown when subtitle-first pipeline evidence is available in session.
+    """
+    evidence = st.session_state.get('subtitle_first_evidence', [])
+    global_summary = st.session_state.get('subtitle_first_global_summary', {})
+    if not evidence:
+        return
+
+    with st.expander(tr("Evidence Preview"), expanded=False):
+        # ── Cost estimation ────────────────────────────────────
+        total_chars = sum(len(pkg.get("subtitle_text", "")) for pkg in evidence)
+        estimated_tokens = int(total_chars * 1.5)  # rough CJK token estimate
+        st.caption(
+            f"Scenes: {len(evidence)} | "
+            f"Subtitle chars: {total_chars} | "
+            f"Est. input tokens: ~{estimated_tokens}"
+        )
+
+        # ── Global summary ─────────────────────────────────────
+        if global_summary:
+            arc = global_summary.get("arc", "")
+            summary_text = global_summary.get("summary", "")
+            if arc or summary_text:
+                st.markdown(f"**Arc:** {arc}")
+                if summary_text:
+                    st.markdown(f"**Summary:** {summary_text}")
+
+        # ── Per-segment evidence cards ─────────────────────────
+        for idx, pkg in enumerate(evidence):
+            scene_id = pkg.get("scene_id", idx + 1)
+            ts = pkg.get("timestamp", "")
+            subtitle = pkg.get("subtitle_text", "")[:120]
+            emotion = pkg.get("emotion_hint", "neutral")
+            role = pkg.get("plot_role", "")
+            entities = pkg.get("entities", [])
+
+            label = f"Scene {scene_id}"
+            if ts:
+                label += f" ({ts})"
+            if role:
+                label += f" [{role}]"
+
+            with st.container(border=True):
+                cols = st.columns([3, 1])
+                with cols[0]:
+                    st.markdown(f"**{label}**")
+                    st.caption(subtitle if subtitle else "(no subtitle)")
+                with cols[1]:
+                    if emotion and emotion != "neutral":
+                        st.markdown(f"Emotion: `{emotion}`")
+                    if entities:
+                        st.markdown(f"Entities: {', '.join(entities[:5])}")
+
+
+def _render_script_editor(tr):
+    """Render the script editor with per-segment lock toggle, fit check, and regen button.
+
+    Returns the raw text area value for saving.
+    """
+    script_items = st.session_state.get('video_clip_json', [])
+
+    # Initialise lock state once
+    if 'script_locks' not in st.session_state:
+        st.session_state['script_locks'] = {}
+
+    if script_items and isinstance(script_items, list) and len(script_items) > 0:
+        # ── Per-segment interactive editor ─────────────────────
+        edited_items = []
+        for idx, item in enumerate(script_items):
+            seg_id = item.get("_id", idx + 1)
+            is_locked = st.session_state['script_locks'].get(seg_id, False)
+
+            with st.container(border=True):
+                header_cols = st.columns([1, 6, 2, 2])
+                with header_cols[0]:
+                    st.markdown(f"**#{seg_id}**")
+                with header_cols[1]:
+                    st.caption(item.get("timestamp", ""))
+                with header_cols[2]:
+                    # Lock toggle
+                    new_lock = st.checkbox(
+                        "Lock",
+                        value=is_locked,
+                        key=f"lock_cb_{seg_id}",
+                        help="Lock this segment to prevent regeneration",
+                    )
+                    st.session_state['script_locks'][seg_id] = new_lock
+                with header_cols[3]:
+                    # Fit check indicator
+                    narration = item.get("narration", "")
+                    ts = item.get("timestamp", "")
+                    duration = _parse_timestamp_duration(ts)
+                    if duration > 0 and narration:
+                        fc = fit_check(narration, duration)
+                        severity = fc.get("severity", "ok")
+                        if severity == "ok":
+                            st.markdown(":green[OK]")
+                        elif severity == "warn":
+                            st.markdown(f":orange[+{fc.get('overflow', 0)}ch]")
+                        else:
+                            st.markdown(f":red[+{fc.get('overflow', 0)}ch]")
+
+                # Editable narration (disabled when locked)
+                new_narration = st.text_area(
+                    "Narration",
+                    value=item.get("narration", ""),
+                    key=f"narration_{seg_id}",
+                    height=80,
+                    disabled=new_lock,
+                    label_visibility="collapsed",
+                )
+
+                updated_item = dict(item)
+                updated_item["narration"] = new_narration
+                edited_items.append(updated_item)
+
+        # Sync edits back
+        st.session_state['video_clip_json'] = edited_items
+
+    # Raw JSON editor (fallback / advanced)
+    video_clip_json_details = st.text_area(
+        tr("Video Script"),
+        value=json.dumps(st.session_state.get('video_clip_json', []), indent=2, ensure_ascii=False),
+        height=500,
+    )
+    return video_clip_json_details
+
+
+def _parse_timestamp_duration(ts: str) -> float:
+    """Parse 'HH:MM:SS,mmm-HH:MM:SS,mmm' and return duration in seconds."""
+    try:
+        parts = ts.split("-")
+        if len(parts) != 2:
+            return 0.0
+        start = _ts_to_seconds(parts[0].strip())
+        end = _ts_to_seconds(parts[1].strip())
+        return max(end - start, 0.0)
+    except Exception:
+        return 0.0
+
+
+def _ts_to_seconds(ts: str) -> float:
+    """Convert 'HH:MM:SS,mmm' to seconds."""
+    ts = ts.replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    return 0.0
 
 
 def load_script(tr, script_path):

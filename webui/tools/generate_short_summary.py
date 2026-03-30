@@ -17,6 +17,7 @@ from loguru import logger
 from app.config import config
 from app.services.SDE.short_drama_explanation import analyze_subtitle, generate_narration_script
 from app.services.subtitle_text import read_subtitle_text
+from app.services.subtitle_first_pipeline import run_subtitle_first_pipeline
 # 导入新的LLM服务模块 - 确保提供商被注册
 import app.services.llm  # 这会触发提供商注册
 from app.services.llm.migration_adapter import SubtitleAnalyzerAdapter
@@ -138,14 +139,17 @@ def parse_and_fix_json(json_string):
 def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature):
     """
     生成 短剧解说 视频脚本
-    要求: 提供高质量短剧字幕
+    要求: 提供高质量短剧字幕（支持 SRT / ASS / VTT）
     适合场景: 短剧
+
+    优先使用字幕优先管线（subtitle-first pipeline），如果管线失败
+    则回退到旧的 LLM 分析方式。
     """
     progress_bar = st.progress(0)
     status_text = st.empty()
 
     def update_progress(progress: float, message: str = ""):
-        progress_bar.progress(progress)
+        progress_bar.progress(min(int(progress), 100))
         if message:
             status_text.text(f"{progress}% - {message}")
         else:
@@ -156,39 +160,54 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             if not params.video_origin_path:
                 st.error("请先选择视频文件")
                 return
-            """
-            1. 获取字幕
-            """
-            update_progress(30, "正在解析字幕...")
-            # 判断字幕文件是否存在
-            if not os.path.exists(subtitle_path):
+
+            if not subtitle_path or not os.path.exists(subtitle_path):
                 st.error("字幕文件不存在")
                 return
 
-            """
-            2. 分析字幕总结剧情 - 使用新的LLM服务架构
-            """
+            # Resolve text LLM configuration
             text_provider = config.app.get('text_llm_provider', 'gemini').lower()
-            text_api_key = config.app.get(f'text_{text_provider}_api_key')
-            text_model = config.app.get(f'text_{text_provider}_model_name')
-            text_base_url = config.app.get(f'text_{text_provider}_base_url')
+            text_api_key = config.app.get(f'text_{text_provider}_api_key', '')
+            text_model = config.app.get(f'text_{text_provider}_model_name', '')
+            text_base_url = config.app.get(f'text_{text_provider}_base_url', '')
 
-            # 读取字幕文件内容（无论使用哪种实现都需要）
+            # ── Try subtitle-first pipeline first ──────────────────
+            logger.info("尝试使用字幕优先管线生成解说脚本")
+            pipeline_result = run_subtitle_first_pipeline(
+                video_path=params.video_origin_path,
+                subtitle_path=subtitle_path,
+                text_api_key=text_api_key,
+                text_base_url=text_base_url,
+                text_model=text_model,
+                style="short_drama",
+                progress_callback=update_progress,
+            )
+
+            if pipeline_result["success"] and pipeline_result["script_items"]:
+                logger.success("字幕优先管线成功")
+                st.session_state['video_clip_json'] = pipeline_result["script_items"]
+                update_progress(100, "脚本生成完成！")
+                st.success("视频脚本生成成功！")
+                return
+
+            # ── Fallback: legacy LLM analysis approach ─────────────
+            logger.warning(
+                f"字幕优先管线未成功 (error={pipeline_result.get('error', '')}), "
+                "回退到旧的 LLM 分析方式"
+            )
+            update_progress(30, "正在解析字幕 (legacy)...")
+
             subtitle_content = read_subtitle_text(subtitle_path).text
             if not subtitle_content:
                 st.error("字幕文件内容为空或无法读取")
                 return
 
             try:
-                # 优先使用新的LLM服务架构
                 logger.info("使用新的LLM服务架构进行字幕分析")
                 analyzer = SubtitleAnalyzerAdapter(text_api_key, text_model, text_base_url, text_provider)
-
                 analysis_result = analyzer.analyze_subtitle(subtitle_content)
-
             except Exception as e:
                 logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
-                # 回退到旧的实现
                 analysis_result = analyze_subtitle(
                     subtitle_file_path=subtitle_path,
                     api_key=text_api_key,
@@ -198,77 +217,62 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                     temperature=temperature,
                     provider=text_provider
                 )
-            """
-            3. 根据剧情生成解说文案
-            """
-            if analysis_result["status"] == "success":
-                logger.info("字幕分析成功！")
-                update_progress(60, "正在生成文案...")
 
-                # 根据剧情生成解说文案 - 使用新的LLM服务架构
-                try:
-                    # 优先使用新的LLM服务架构
-                    logger.info("使用新的LLM服务架构生成解说文案")
-                    narration_result = analyzer.generate_narration_script(
-                        short_name=video_theme,
-                        plot_analysis=analysis_result["analysis"],
-                        subtitle_content=subtitle_content,  # 传递原始字幕内容
-                        temperature=temperature
-                    )
-                except Exception as e:
-                    logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
-                    # 回退到旧的实现
-                    narration_result = generate_narration_script(
-                        short_name=video_theme,
-                        plot_analysis=analysis_result["analysis"],
-                        subtitle_content=subtitle_content,  # 传递原始字幕内容
-                        api_key=text_api_key,
-                        model=text_model,
-                        base_url=text_base_url,
-                        save_result=True,
-                        temperature=temperature,
-                        provider=text_provider
-                    )
-
-                if narration_result["status"] == "success":
-                    logger.info("\n解说文案生成成功！")
-                    logger.info(narration_result["narration_script"])
-                else:
-                    logger.info(f"\n解说文案生成失败: {narration_result['message']}")
-                    st.error("生成脚本失败，请检查日志")
-                    st.stop()
-            else:
+            if analysis_result["status"] != "success":
                 logger.error(f"分析失败: {analysis_result['message']}")
                 st.error("生成脚本失败，请检查日志")
                 st.stop()
 
-            """
-            4. 生成文案
-            """
-            logger.info("开始准备生成解说文案")
+            logger.info("字幕分析成功！")
+            update_progress(60, "正在生成文案...")
 
-            # 结果转换为JSON字符串
+            try:
+                logger.info("使用新的LLM服务架构生成解说文案")
+                narration_result = analyzer.generate_narration_script(
+                    short_name=video_theme,
+                    plot_analysis=analysis_result["analysis"],
+                    subtitle_content=subtitle_content,
+                    temperature=temperature
+                )
+            except Exception as e:
+                logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
+                narration_result = generate_narration_script(
+                    short_name=video_theme,
+                    plot_analysis=analysis_result["analysis"],
+                    subtitle_content=subtitle_content,
+                    api_key=text_api_key,
+                    model=text_model,
+                    base_url=text_base_url,
+                    save_result=True,
+                    temperature=temperature,
+                    provider=text_provider
+                )
+
+            if narration_result["status"] != "success":
+                logger.info(f"\n解说文案生成失败: {narration_result['message']}")
+                st.error("生成脚本失败，请检查日志")
+                st.stop()
+
+            logger.info("\n解说文案生成成功！")
             narration_script = narration_result["narration_script"]
 
-            # 增强JSON解析，包含错误处理和修复
             narration_dict = parse_and_fix_json(narration_script)
             if narration_dict is None:
                 st.error("生成的解说文案格式错误，无法解析为JSON")
                 logger.error(f"JSON解析失败，原始内容: {narration_script}")
                 st.stop()
 
-            # 验证JSON结构
             if 'items' not in narration_dict:
                 st.error("生成的解说文案缺少必要的'items'字段")
                 logger.error(f"JSON结构错误，缺少items字段: {narration_dict}")
                 st.stop()
 
             script = json.dumps(narration_dict['items'], ensure_ascii=False, indent=2)
-
             if script is None:
                 st.error("生成脚本失败，请检查日志")
                 st.stop()
-            logger.success(f"剪辑脚本生成完成")
+
+            logger.success("剪辑脚本生成完成")
             if isinstance(script, list):
                 st.session_state['video_clip_json'] = script
             elif isinstance(script, str):

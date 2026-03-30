@@ -44,7 +44,6 @@ def align_subtitles_to_scenes(
         return []
 
     aligned: List[Dict] = []
-    sub_idx = 0  # pointer into sorted subtitles (they are already sorted)
 
     for scene in scenes:
         scene_start = scene["start"]

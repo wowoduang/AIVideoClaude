@@ -1,8 +1,35 @@
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
+
+
+# ── Oral filler words to strip (Chinese) ──────────────────────────
+# Common meaningless fillers in spoken Chinese subtitles.
+ORAL_FILLERS_ZH = [
+    "嗯嗯", "嗯", "啊啊", "啊", "呃", "额", "哦", "噢",
+    "那个", "就是说", "就是", "然后呢", "然后",
+    "对对对", "对对", "是吧", "你知道吗", "怎么说呢",
+]
+# Build a regex pattern – match fillers at word boundaries.
+# Longer fillers first so "嗯嗯" is tried before "嗯".
+_ORAL_FILLER_RE = re.compile(
+    "|".join(re.escape(w) for w in sorted(ORAL_FILLERS_ZH, key=len, reverse=True))
+)
+
+# ── Speaker label patterns ────────────────────────────────────────
+# Matches patterns like "[A]:" or "【说话人1】:" or "Speaker1:" at the
+# beginning of a subtitle line.
+_SPEAKER_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"\[(?P<s1>[^\]]+)\]"
+    r"|【(?P<s2>[^】]+)】"
+    r"|(?P<s3>[A-Za-z\u4e00-\u9fff]+\d*)"
+    r")"
+    r"\s*[:：]\s*"
+)
 
 
 SRT_TIME_RE = re.compile(
@@ -241,6 +268,32 @@ def parse_subtitle_file(filename: str) -> List[Dict]:
     return parse_srt_file(filename)
 
 
+def _extract_speaker(text: str) -> Tuple[str, str]:
+    """Extract speaker label from the beginning of subtitle text.
+
+    Returns (speaker, remaining_text).  If no speaker label is found,
+    returns ("", original_text).
+    """
+    if not text:
+        return "", ""
+    m = _SPEAKER_RE.match(text)
+    if not m:
+        return "", text
+    speaker = (m.group("s1") or m.group("s2") or m.group("s3") or "").strip()
+    remaining = text[m.end():].strip()
+    return speaker, remaining
+
+
+def _strip_oral_fillers(text: str) -> str:
+    """Remove oral filler words from text (optional cleaning step)."""
+    if not text:
+        return ""
+    cleaned = _ORAL_FILLER_RE.sub("", text)
+    # Collapse multiple spaces introduced by removal
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def _clean_text(text: str) -> str:
     if not text:
         return ""
@@ -258,23 +311,65 @@ def normalize_segments(
     max_duration: float = 8.0,
     min_duration: float = 0.35,
     merge_gap: float = 0.45,
+    strip_fillers: bool = True,
+    detect_speaker: bool = True,
 ) -> List[Dict]:
+    """Normalize subtitle segments.
+
+    Parameters
+    ----------
+    segments : list
+        Raw parsed subtitle segments.
+    max_chars : int
+        Max characters per segment before forcing a split.
+    max_duration : float
+        Max duration (seconds) per segment.
+    min_duration : float
+        Minimum duration; shorter segments are extended.
+    merge_gap : float
+        Adjacent segments with gap <= this value may be merged.
+    strip_fillers : bool
+        If True, remove common oral filler words (e.g. 嗯, 那个).
+    detect_speaker : bool
+        If True, extract speaker labels from text (e.g. [A]: ...).
+    """
     cleaned: List[Dict] = []
     for item in segments or []:
-        text = _clean_text(item.get("text", ""))
+        raw_text = item.get("text", "")
+
+        # Speaker extraction (optional)
+        speaker = ""
+        if detect_speaker:
+            speaker, raw_text = _extract_speaker(raw_text)
+
+        text = _clean_text(raw_text)
+
+        # Oral filler removal (optional)
+        if strip_fillers and text:
+            text = _strip_oral_fillers(text)
+            text = _clean_text(text)
+
         if not text:
             continue
+
         start = float(item.get("start", 0) or 0)
         end = float(item.get("end", start + 0.5) or (start + 0.5))
         if end <= start:
             end = start + 0.5
-        cleaned.append({
+
+        seg_dict: Dict = {
             "seg_id": item.get("seg_id") or f"sub_{len(cleaned)+1:04d}",
             "start": start,
             "end": end,
             "text": text,
             "source": item.get("source", "subtitle"),
-        })
+        }
+        if speaker:
+            seg_dict["speaker"] = speaker
+        # Propagate confidence from ASR results if present
+        if "confidence" in item:
+            seg_dict["confidence"] = float(item["confidence"])
+        cleaned.append(seg_dict)
 
     if not cleaned:
         return []

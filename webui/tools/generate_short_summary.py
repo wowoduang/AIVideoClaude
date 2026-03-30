@@ -186,6 +186,9 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
             if pipeline_result["success"] and pipeline_result["script_items"]:
                 logger.success("字幕优先管线成功")
                 st.session_state['video_clip_json'] = pipeline_result["script_items"]
+                # Store evidence and global summary for WebUI preview
+                st.session_state['subtitle_first_evidence'] = pipeline_result.get("evidence", [])
+                st.session_state['subtitle_first_global_summary'] = pipeline_result.get("global_summary", {})
                 update_progress(100, "脚本生成完成！")
                 st.success("视频脚本生成成功！")
                 return

@@ -9,6 +9,7 @@ Connects all modules in the subtitle-first narration video workflow:
     -> M5  Subtitle-scene alignment
     -> M6  Representative frame extraction
     -> M7  Evidence package construction
+    -> M8  Plot understanding (local + global)
     -> M9  Two-stage script generation (facts -> polish)
     -> M10 Timeline budget enforcement
     -> M11 Preflight validation
@@ -28,6 +29,7 @@ from app.services.align_subtitle_scene import align_subtitles_to_scenes
 from app.services.evidence_fuser import fuse_scene_evidence
 from app.services.frame_selector import select_representative_frames
 from app.services.generate_narration_script import generate_narration_from_scene_evidence
+from app.services.plot_understanding import add_local_understanding, build_global_summary
 from app.services.preflight_check import PreflightError, validate_script_items
 from app.services.scene_builder import build_scenes_from_subtitles
 from app.services.script_fallback import ensure_script_shape
@@ -169,7 +171,6 @@ def _run(
 
     # ── M7: Evidence package construction ──────────────────────────
     progress(50, "证据融合...")
-    # Build evidence from aligned scenes (no visual analysis in subtitle-first mode)
     evidence = fuse_scene_evidence(
         scenes=aligned_scenes,
         frame_records=frame_records,
@@ -178,6 +179,20 @@ def _run(
     # Enrich evidence with aligned subtitle text
     _enrich_evidence_with_alignment(evidence, aligned_scenes)
     logger.info(f"M7 完成: {len(evidence)} 个证据包")
+
+    # ── M8: Plot understanding ────────────────────────────────────
+    progress(55, "剧情理解...")
+    evidence = add_local_understanding(evidence)
+    global_summary = build_global_summary(
+        evidence,
+        api_key=text_api_key,
+        base_url=text_base_url,
+        model=text_model,
+    )
+    logger.info(
+        f"M8 完成: arc={global_summary.get('arc')}, "
+        f"key_segments={len(global_summary.get('key_segments', []))}"
+    )
 
     # ── M9: Two-stage script generation ────────────────────────────
     progress(60, "两阶段脚本生成...")
@@ -222,6 +237,8 @@ def _run(
     return {
         "script_items": script_items,
         "script_path": output_script_path,
+        "evidence": evidence,
+        "global_summary": global_summary,
         "success": True,
         "error": "",
     }

@@ -104,6 +104,7 @@ def _load_model() -> bool:
     model_path, searched = _resolve_model_path()
     if not model_path:
         searched_text = "\n".join([f"- {p}" for p in searched])
+        bases_text = "\n".join([f"- {d}" for d in _base_dirs()])
         logger.error(
             "请先下载 whisper 模型\n\n"
             "********************************************\n"
@@ -111,7 +112,12 @@ def _load_model() -> bool:
             "https://huggingface.co/guillaumekln/faster-whisper-large-v3\n"
             "或：\n"
             "https://huggingface.co/guillaumekln/faster-whisper-large-v2\n\n"
-            "存放路径示例：app/models/faster-whisper-large-v3\n"
+            "存放路径示例：app/models/faster-whisper-large-v3\n\n"
+            f"root_dir(): {utils.root_dir()}\n"
+            f"cwd: {os.getcwd()}\n"
+            f"executable: {sys.executable}\n\n"
+            "搜索基础目录：\n"
+            f"{bases_text}\n\n"
             "已搜索目录：\n"
             f"{searched_text}\n"
             "********************************************\n"

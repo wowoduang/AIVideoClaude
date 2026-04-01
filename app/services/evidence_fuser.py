@@ -1,85 +1,221 @@
+from __future__ import annotations
+
+import json
+import os
 import re
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from loguru import logger
-from app.utils import utils
-from app.services.timeline_allocator import estimate_char_budget
 
 
-# ── Simple keyword-based emotion hints ──────────────────────────
-_EMOTION_KEYWORDS: List[tuple] = [
-    ("angry", ["愤怒", "生气", "愤懨", "发火", "可恶", "混蛋", "该死", "滚", "打死"]),
-    ("sad", ["伤心", "难过", "哭", "泪", "悲伤", "心痛", "想念", "离开", "再见"]),
-    ("happy", ["开心", "高兴", "笑", "哈哈", "太好了", "棒", "幸福", "喜欢"]),
-    ("surprise", ["呃", "不会吧", "真的吗", "怎么可能", "惊讶", "天啊", "我的天"]),
-    ("fear", ["害怕", "恐惧", "可怕", "打死我", "救命", "危险", "小心"]),
-    ("tension", ["反转", "竟然", "没想到", "秘密", "真相", "隐藏", "暗中"]),
-]
+def _simple_entities(text: str) -> Dict[str, List[str]]:
+    text = (text or "").strip()
+    english_names = re.findall(r"\b[A-Z][a-z]{1,20}\b", text)
+    quoted = re.findall(r"[《“\"]([^》”\"]{1,12})[》”\"]", text)
+    chars = []
+    for item in english_names + quoted:
+        if item not in chars:
+            chars.append(item)
+    return {"characters": chars[:6], "locations": [], "props": []}
 
 
-def _detect_emotion(text: str) -> str:
-    """Detect a simple emotion hint from subtitle text via keyword matching."""
-    if not text:
-        return "neutral"
-    for emotion, keywords in _EMOTION_KEYWORDS:
-        for kw in keywords:
-            if kw in text:
-                return emotion
-    return "neutral"
+def _emotion_from_text(text: str, visual_summary: List[Dict]) -> str:
+    joined = (text or "") + " " + " ".join(x.get("desc", "") for x in visual_summary)
+    cues = {
+        "愤怒": ["生气", "愤怒", "怒", "吼", "骂"],
+        "悲伤": ["哭", "难过", "伤心", "泪", "沉默"],
+        "喜悦": ["笑", "开心", "高兴", "兴奋"],
+        "紧张": ["紧张", "小心", "快", "别动", "危险"],
+        "惊讶": ["什么", "怎么", "居然", "突然", "惊讶"],
+        "恐惧": ["害怕", "恐惧", "别过来", "救命"],
+    }
+    for label, words in cues.items():
+        if any(w in joined for w in words):
+            return label
+    return "平静"
 
 
-# ── Lightweight entity extraction ───────────────────────────────
-_ENTITY_PATTERNS = [
-    # Quoted names / terms in Chinese
-    ("quoted", re.compile(r"[「『“\"]’([^」』”\"]+)[」』”\"]’")),
-    # Titles / honorifics followed by a name
-    ("person", re.compile(r"(?:老师|医生|老板|总裁|局长|队长|老大|小姐|先生|女士)(?:[A-Za-z一-鿿]{1,4})")),
-    # Place names ending with common suffixes
-    ("place", re.compile(r"[一-鿿]{2,4}(?:市|区|县|镇|村|山|河|湖|公司|医院|学校)")),
-]
+def _build_context_window(index: int, scenes: List[Dict], prev_n: int, next_n: int) -> Dict[str, List[str]]:
+    prev_items = []
+    next_items = []
+    for item in scenes[max(0, index - prev_n): index]:
+        prev_items.append((item.get("aligned_subtitle_text") or item.get("subtitle_text") or "")[:60])
+    for item in scenes[index + 1: index + 1 + next_n]:
+        next_items.append((item.get("aligned_subtitle_text") or item.get("subtitle_text") or "")[:60])
+    return {"prev": prev_items, "next": next_items}
 
 
-def _extract_entities(text: str) -> List[str]:
-    """Extract simple named entities from text using regex patterns."""
-    if not text:
-        return []
-    entities: List[str] = []
-    seen: set = set()
-    for _label, pattern in _ENTITY_PATTERNS:
-        for m in pattern.finditer(text):
-            entity = m.group(0).strip()
-            if entity and entity not in seen:
-                seen.add(entity)
-                entities.append(entity)
-    return entities
+def _guess_confidence(scene: Dict) -> str:
+    if scene.get("visual_only"):
+        return "visual_only"
+    source = (scene.get("subtitle_source") or "").lower()
+    if "srt" in source or "ass" in source or "vtt" in source:
+        return "srt"
+    if scene.get("low_confidence"):
+        return "asr_low"
+    return "asr_high"
 
 
-def parse_visual_analysis_results(results: List[Dict], selected_frames: List[Dict]) -> Dict[str, List[Dict]]:
-    frame_map = {record["frame_path"]: record for record in selected_frames}
-    observations: Dict[str, List[Dict]] = {}
-    file_cursor = 0
-    ordered_paths = [item["frame_path"] for item in selected_frames]
+def _default_visual_desc(frame_path: str, rank: int) -> str:
+    name = os.path.basename(frame_path)
+    return f"第{rank}张代表帧，来自{name}"
 
-    for result in results or []:
-        if "error" in result:
-            continue
-        response = result.get("response", "")
-        parsed = _try_parse_json(response)
-        if not parsed:
-            continue
-        frame_observations = parsed.get("frame_observations", []) or []
-        for obs in frame_observations:
-            if file_cursor >= len(ordered_paths):
+
+def _safe_load_visual_input(data: Any) -> Any:
+    """
+    兼容几种输入：
+    1. 已经是 Python dict/list
+    2. JSON 字符串
+    3. JSON 文件路径
+    """
+    if data is None:
+        return None
+
+    if isinstance(data, (dict, list)):
+        return data
+
+    if isinstance(data, str):
+        raw = data.strip()
+        if not raw:
+            return None
+
+        if os.path.exists(raw):
+            try:
+                with open(raw, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning("读取视觉分析文件失败: {}", e)
+                return None
+
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    return None
+
+
+def parse_visual_analysis_results(results: Any) -> Dict[str, List[Dict]]:
+    """
+    兼容旧 WebUI 的导入接口。
+    输出统一格式：
+    {
+        "segment_xxx": [
+            {
+                "frame_path": "...jpg",
+                "observation": "人物站在门口，神情紧张",
+                "model": "gemini/qwen/unknown"
+            }
+        ]
+    }
+
+    支持输入：
+    - dict
+    - list
+    - JSON 字符串
+    - JSON 文件路径
+    """
+    data = _safe_load_visual_input(results)
+    parsed: Dict[str, List[Dict]] = {}
+
+    if not data:
+        return parsed
+
+    # 情况1：已经是目标格式
+    # {segment_id: [{frame_path, observation}, ...]}
+    if isinstance(data, dict):
+        # 1a. 顶层就是 segment_id -> list[dict]
+        all_values_are_lists = all(isinstance(v, list) for v in data.values()) if data else False
+        if all_values_are_lists:
+            for seg_id, items in data.items():
+                bucket = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    frame_path = item.get("frame_path") or item.get("image") or item.get("path") or ""
+                    observation = (
+                        item.get("observation")
+                        or item.get("desc")
+                        or item.get("description")
+                        or item.get("summary")
+                        or ""
+                    )
+                    bucket.append(
+                        {
+                            "frame_path": frame_path,
+                            "observation": observation,
+                            "model": item.get("model", "unknown"),
+                        }
+                    )
+                if bucket:
+                    parsed[str(seg_id)] = bucket
+            return parsed
+
+        # 1b. 常见包装结构
+        for key in ["results", "data", "items", "frames", "analyses"]:
+            if key in data and isinstance(data[key], list):
+                data = data[key]
                 break
-            frame_path = ordered_paths[file_cursor]
-            scene_id = frame_map.get(frame_path, {}).get("scene_id", "unknown")
-            observations.setdefault(scene_id, []).append({
-                "frame_path": frame_path,
-                "timestamp_seconds": frame_map.get(frame_path, {}).get("timestamp_seconds", 0.0),
-                "observation": obs.get("observation", "").strip(),
-            })
-            file_cursor += 1
-    return observations
+        else:
+            # 1c. 单条记录 dict
+            data = [data]
+
+    # 情况2：list[dict]
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            seg_id = (
+                item.get("segment_id")
+                or item.get("scene_id")
+                or item.get("clip_id")
+                or item.get("id")
+            )
+            if not seg_id:
+                seg_id = "global"
+
+            frame_path = item.get("frame_path") or item.get("image") or item.get("path") or ""
+            observation = (
+                item.get("observation")
+                or item.get("desc")
+                or item.get("description")
+                or item.get("summary")
+                or item.get("caption")
+                or ""
+            )
+
+            # 有些结果把多帧分析放在 children / frames
+            children = item.get("frames") or item.get("children")
+            if isinstance(children, list) and children:
+                for child in children:
+                    if not isinstance(child, dict):
+                        continue
+                    child_frame = child.get("frame_path") or child.get("image") or child.get("path") or frame_path
+                    child_obs = (
+                        child.get("observation")
+                        or child.get("desc")
+                        or child.get("description")
+                        or child.get("summary")
+                        or observation
+                    )
+                    parsed.setdefault(str(seg_id), []).append(
+                        {
+                            "frame_path": child_frame,
+                            "observation": child_obs,
+                            "model": child.get("model") or item.get("model", "unknown"),
+                        }
+                    )
+            else:
+                parsed.setdefault(str(seg_id), []).append(
+                    {
+                        "frame_path": frame_path,
+                        "observation": observation,
+                        "model": item.get("model", "unknown"),
+                    }
+                )
+
+    return parsed
 
 
 def fuse_scene_evidence(
@@ -89,111 +225,70 @@ def fuse_scene_evidence(
     context_prev: int = 2,
     context_next: int = 1,
 ) -> List[Dict]:
-    """Construct evidence packages from aligned scenes and frame data.
-
-    Parameters
-    ----------
-    scenes : list
-        Aligned scene dicts.
-    frame_records : list
-        Frame selection records.
-    visual_observations : dict
-        Per-scene visual observation dicts.
-    context_prev : int
-        Number of preceding segments’ summaries to include in the
-        ``context_window`` (PRD default: 2).
-    context_next : int
-        Number of following segments’ summaries to include (PRD default: 1).
-    """
-    scene_frames: Dict[str, List[Dict]] = {}
-    for record in frame_records or []:
-        scene_frames.setdefault(record["scene_id"], []).append(record)
+    """Construct evidence packages from aligned scenes and frame data."""
+    frame_map: Dict[str, List[Dict]] = {}
+    for rec in frame_records or []:
+        segment_id = rec.get("segment_id")
+        scene_id = rec.get("scene_id")
+        key = segment_id or scene_id
+        if not key:
+            continue
+        frame_map.setdefault(key, []).append(rec)
 
     evidence: List[Dict] = []
-    scene_list = list(scenes or [])
+    for idx, scene in enumerate(scenes or []):
+        segment_id = scene.get("segment_id") or scene.get("scene_id")
+        scene_id = scene.get("scene_id") or segment_id
+        subtitle_text = (scene.get("aligned_subtitle_text") or scene.get("subtitle_text") or "").strip()
 
-    for idx, scene in enumerate(scene_list):
-        scene_id = scene["scene_id"]
-        frames = sorted(scene_frames.get(scene_id, []), key=lambda x: x["timestamp_seconds"])
-        visuals = visual_observations.get(scene_id, [])
-        visual_summary = " ".join([v.get("observation", "") for v in visuals[:3]]).strip()
-        duration = scene["end"] - scene["start"]
-        char_budget = estimate_char_budget(duration)
-        subtitle_text = scene.get("subtitle_text", "")
-
-        # PRD M7: entities extraction
-        entities = _extract_entities(subtitle_text)
-
-        # PRD M7: emotion_hint
-        emotion_hint = _detect_emotion(subtitle_text)
-
-        # PRD M7: confidence (average of subtitle segment confidences)
-        confidence = _compute_scene_confidence(scene)
-
-        # PRD M7: context_window (prev N + next M segment summaries)
-        context_window = _build_context_window(
-            scene_list, idx, context_prev, context_next
+        records = sorted(
+            frame_map.get(segment_id, []) + frame_map.get(scene_id, []),
+            key=lambda x: x.get("rank", 0)
         )
 
-        evidence.append({
-            "scene_id": scene_id,
-            "start": scene["start"],
-            "end": scene["end"],
-            "timestamp": f"{utils.format_time(scene['start'])}-{utils.format_time(scene['end'])}",
-            "subtitle_ids": scene.get("subtitle_ids", []),
-            "subtitle_text": subtitle_text,
-            "frame_paths": [f["frame_path"] for f in frames],
-            "visual_summary": visual_summary,
-            "char_budget": char_budget,
-            "entities": entities,
-            "emotion_hint": emotion_hint,
-            "confidence": confidence,
-            "context_window": context_window,
-        })
-    logger.info(f"证据融合完成: {len(evidence)} 个 scene evidence")
+        seen = set()
+        unique_records = []
+        for rec in records:
+            fp = rec.get("frame_path")
+            if not fp or fp in seen:
+                continue
+            seen.add(fp)
+            unique_records.append(rec)
+
+        visual_summary = []
+        obs_lookup = visual_observations.get(segment_id) or visual_observations.get(scene_id) or []
+        obs_by_path = {x.get("frame_path"): x for x in obs_lookup if x.get("frame_path")}
+
+        for rank, rec in enumerate(unique_records, start=1):
+            fp = rec.get("frame_path")
+            observation = obs_by_path.get(fp, {}).get("observation") or _default_visual_desc(fp, rank)
+            visual_summary.append({"frame": fp, "desc": observation})
+
+        evidence.append(
+            {
+                "segment_id": segment_id,
+                "scene_id": scene_id,
+                "time_window": [
+                    round(float(scene.get("start", 0.0) or 0.0), 3),
+                    round(float(scene.get("end", 0.0) or 0.0), 3),
+                ],
+                "timestamp": scene.get("timestamp", ""),
+                "main_text_evidence": subtitle_text,
+                "subtitle_text": subtitle_text,
+                "subtitle_ids": list(scene.get("subtitle_ids") or scene.get("aligned_subtitle_ids") or []),
+                "visual_summary": visual_summary,
+                "frame_paths": [x.get("frame") for x in visual_summary],
+                "entities": _simple_entities(subtitle_text),
+                "emotion_hint": _emotion_from_text(subtitle_text, visual_summary),
+                "confidence": _guess_confidence(scene),
+                "context_window": _build_context_window(idx, scenes, context_prev, context_next),
+                "visual_only": bool(scene.get("visual_only")),
+                "segment_type": scene.get("segment_type") or ("visual_only" if scene.get("visual_only") else "dialogue"),
+                "picture": "；".join(x["desc"] for x in visual_summary[:2]) or subtitle_text[:20] or "画面推进",
+                "start": round(float(scene.get("start", 0.0) or 0.0), 3),
+                "end": round(float(scene.get("end", 0.0) or 0.0), 3),
+            }
+        )
+
+    logger.info("证据包构建完成: {} 个", len(evidence))
     return evidence
-
-
-def _compute_scene_confidence(scene: Dict) -> float:
-    """Compute average confidence for a scene from its subtitle segments."""
-    # If aligned subtitle segments carry confidence, average them
-    # Otherwise default to 1.0 (external subtitles are high confidence)
-    confidences = scene.get("_subtitle_confidences", [])
-    if not confidences:
-        return 1.0
-    return round(sum(confidences) / len(confidences), 3)
-
-
-def _build_context_window(
-    scenes: List[Dict], current_idx: int, prev_n: int, next_n: int,
-) -> Dict[str, List[str]]:
-    """Build a context window with summaries from neighboring scenes."""
-    prev_summaries: List[str] = []
-    for i in range(max(0, current_idx - prev_n), current_idx):
-        text = (scenes[i].get("subtitle_text", "") or "").strip()
-        if text:
-            prev_summaries.append(text[:60])
-
-    next_summaries: List[str] = []
-    for i in range(current_idx + 1, min(len(scenes), current_idx + 1 + next_n)):
-        text = (scenes[i].get("subtitle_text", "") or "").strip()
-        if text:
-            next_summaries.append(text[:60])
-
-    return {"prev": prev_summaries, "next": next_summaries}
-
-
-def _try_parse_json(response_text: str):
-    import json
-
-    if not response_text:
-        return None
-    content = response_text.strip()
-    try:
-        if "```json" in content:
-            content = content.split("```json", 1)[1].split("```", 1)[0].strip()
-        elif "```" in content:
-            content = content.split("```", 1)[1].split("```", 1)[0].strip()
-        return json.loads(content)
-    except Exception:
-        return None

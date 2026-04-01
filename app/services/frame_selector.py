@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from typing import Dict, List
 
@@ -7,9 +9,7 @@ from loguru import logger
 def parse_keyframe_timestamp(path: str) -> float:
     filename = os.path.basename(path)
     parts = filename.split("_")
-    if len(parts) < 3:
-        return 0.0
-    raw = parts[-1].split(".")[0]
+    raw = parts[-1].split(".")[0] if parts else ""
     if raw.isdigit() and len(raw) >= 9:
         h = int(raw[0:2])
         m = int(raw[2:4])
@@ -22,47 +22,43 @@ def parse_keyframe_timestamp(path: str) -> float:
         return 0.0
 
 
+
 def select_representative_frames(
     scenes: List[Dict],
     keyframe_files: List[str],
     frames_per_scene: int = 2,
 ) -> List[Dict]:
+    """Backward-compatible selector for externally extracted keyframes."""
     if not scenes or not keyframe_files:
         return []
 
-    indexed = [{"frame_path": p, "timestamp_seconds": parse_keyframe_timestamp(p)} for p in keyframe_files]
+    indexed = [
+        {"frame_path": p, "timestamp_seconds": parse_keyframe_timestamp(p)}
+        for p in keyframe_files
+    ]
     records: List[Dict] = []
-
     for scene in scenes:
-        scene_frames = [f for f in indexed if scene["start"] <= f["timestamp_seconds"] <= scene["end"]]
+        start = float(scene.get("start", 0.0) or 0.0)
+        end = float(scene.get("end", 0.0) or 0.0)
+        scene_id = scene.get("scene_id") or scene.get("segment_id") or "scene_000"
+        seg_id = scene.get("segment_id") or scene_id
+        scene_frames = [f for f in indexed if start <= f["timestamp_seconds"] <= end]
         if not scene_frames:
-            center = (scene["start"] + scene["end"]) / 2
-            indexed_sorted = sorted(indexed, key=lambda x: abs(x["timestamp_seconds"] - center))
-            scene_frames = indexed_sorted[:1]
-        selected = _pick_sparse(scene_frames, frames_per_scene)
-        for item in selected:
-            records.append({
-                "scene_id": scene["scene_id"],
-                "frame_path": item["frame_path"],
-                "timestamp_seconds": item["timestamp_seconds"],
-            })
-    logger.info(f"代表帧选择完成: {len(records)} 张，平均每个scene约 {frames_per_scene} 张")
+            continue
+        if len(scene_frames) <= frames_per_scene:
+            selected = scene_frames
+        else:
+            step = max(len(scene_frames) / float(frames_per_scene), 1.0)
+            selected = [scene_frames[min(int(i * step), len(scene_frames) - 1)] for i in range(frames_per_scene)]
+        for rank, frame in enumerate(selected, start=1):
+            records.append(
+                {
+                    "scene_id": scene_id,
+                    "segment_id": seg_id,
+                    "frame_path": frame["frame_path"],
+                    "timestamp_seconds": frame["timestamp_seconds"],
+                    "rank": rank,
+                }
+            )
+    logger.info("外部关键帧选择完成: {} 张", len(records))
     return records
-
-
-def _pick_sparse(items: List[Dict], limit: int) -> List[Dict]:
-    if not items:
-        return []
-    if len(items) <= limit:
-        return items
-    items = sorted(items, key=lambda x: x["timestamp_seconds"])
-    if limit == 1:
-        return [items[len(items) // 2]]
-    if limit == 2:
-        return [items[0], items[-1]]
-    result = [items[0]]
-    step = (len(items) - 1) / (limit - 1)
-    for i in range(1, limit - 1):
-        result.append(items[round(i * step)])
-    result.append(items[-1])
-    return result

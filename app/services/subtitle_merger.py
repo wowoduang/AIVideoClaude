@@ -12,51 +12,34 @@ import re
 import os
 from datetime import datetime, timedelta
 
+from app.utils import utils
+
 
 def parse_time(time_str):
-    """解析时间字符串为timedelta对象"""
-    hours, minutes, seconds_ms = time_str.split(':')
-    seconds, milliseconds = seconds_ms.split(',')
-    
-    td = timedelta(
-        hours=int(hours),
-        minutes=int(minutes),
-        seconds=int(seconds),
-        milliseconds=int(milliseconds)
-    )
-    return td
+    """解析时间字符串为timedelta对象，支持 HH:MM:SS,mmm / HH:MM:SS / 秒数字符串。"""
+    seconds = utils.time_to_seconds(str(time_str or '').strip())
+    return timedelta(milliseconds=int(round(seconds * 1000)))
 
 
 def format_time(td):
     """将timedelta对象格式化为SRT时间字符串"""
-    total_seconds = int(td.total_seconds())
-    hours = total_seconds // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
-    milliseconds = td.microseconds // 1000
-    
+    total_ms = int(round(td.total_seconds() * 1000))
+    hours = total_ms // 3600000
+    minutes = (total_ms % 3600000) // 60000
+    seconds = (total_ms % 60000) // 1000
+    milliseconds = total_ms % 1000
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
 
 def parse_edited_time_range(time_range_str):
-    """从editedTimeRange字符串中提取时间范围"""
+    """从editedTimeRange字符串中提取时间范围，支持毫秒。"""
     if not time_range_str:
         return None, None
-    
-    parts = time_range_str.split('-')
+    parts = str(time_range_str).split('-', 1)
     if len(parts) != 2:
         return None, None
-    
     start_time_str, end_time_str = parts
-    
-    # 将HH:MM:SS格式转换为timedelta
-    start_h, start_m, start_s = map(int, start_time_str.split(':'))
-    end_h, end_m, end_s = map(int, end_time_str.split(':'))
-    
-    start_time = timedelta(hours=start_h, minutes=start_m, seconds=start_s)
-    end_time = timedelta(hours=end_h, minutes=end_m, seconds=end_s)
-    
-    return start_time, end_time
+    return parse_time(start_time_str), parse_time(end_time_str)
 
 
 def merge_subtitle_files(subtitle_items, output_file=None):

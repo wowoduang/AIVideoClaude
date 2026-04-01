@@ -1,210 +1,151 @@
-#!/usr/bin/env python
-# -*- coding: UTF-8 -*-
+from __future__ import annotations
 
 import json
-import os
-import traceback
 from typing import Dict, List
 
-from openai import OpenAI
 from loguru import logger
 
-import app.services.llm  # noqa: F401
-from app.services.llm.migration_adapter import generate_narration as generate_narration_new
-from app.services.prompts import PromptManager
-from app.services.script_fallback import ensure_script_shape
+from app.services.timeline_allocator import estimate_char_budget, fit_check, trim_text_to_budget
+from app.utils import utils
 
-SYSTEM_ROLE = "你是一名专业的影视解说编辑，要求先忠于事实，再保证表达有吸引力。"
-
-
-def parse_frame_analysis_to_markdown(json_file_path):
-    if not os.path.exists(json_file_path):
-        return f"错误: 文件 {json_file_path} 不存在"
-    try:
-        with open(json_file_path, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        markdown = ""
-        summaries = data.get("overall_activity_summaries", [])
-        frame_observations = data.get("frame_observations", [])
-        batch_frames = {}
-        for frame in frame_observations:
-            batch_index = frame.get("batch_index")
-            batch_frames.setdefault(batch_index, []).append(frame)
-        for i, summary in enumerate(summaries, 1):
-            batch_index = summary.get("batch_index")
-            time_range = summary.get("time_range", "")
-            batch_summary = summary.get("summary", "")
-            markdown += f"## 片段 {i}\n"
-            markdown += f"- 时间范围：{time_range}\n"
-            markdown += f"- 片段描述：{batch_summary}\n"
-            markdown += "- 详细描述：\n"
-            for frame in batch_frames.get(batch_index, []):
-                markdown += f"  - {frame.get('timestamp', '')}: {frame.get('observation', '')}\n"
-            markdown += "\n"
-        return markdown
-    except Exception:
-        return f"处理JSON文件时出错: {traceback.format_exc()}"
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
 
 
-def scene_evidence_to_markdown(scene_evidence: List[Dict]) -> str:
-    lines = []
-    for idx, scene in enumerate(scene_evidence or [], start=1):
-        char_budget = scene.get("char_budget")
-        lines.append(f"## Scene {idx}")
-        lines.append(f"- scene_id: {scene.get('scene_id')}")
-        lines.append(f"- timestamp: {scene.get('timestamp')}")
-        if char_budget:
-            lines.append(f"- 本段字数上限：约 {char_budget} 字")
-        lines.append(f"- subtitle_text: {scene.get('subtitle_text', '')}")
-        lines.append(f"- visual_summary: {scene.get('visual_summary', '')}")
-        lines.append(f"- evidence_mode: {scene.get('evidence_mode', 'subtitle_first')}")
-
-        # M7 enriched fields
-        entities = scene.get("entities", [])
-        if entities:
-            lines.append(f"- entities: {', '.join(entities)}")
-        emotion = scene.get("emotion_hint", "")
-        if emotion and emotion != "neutral":
-            lines.append(f"- emotion_hint: {emotion}")
-
-        # M8 plot understanding
-        plot_role = scene.get("plot_role", "")
-        if plot_role:
-            lines.append(f"- plot_role: {plot_role}")
-        attraction = scene.get("attraction_level", "")
-        if attraction:
-            lines.append(f"- attraction_level: {attraction}")
-
-        # Context window
-        ctx = scene.get("context_window", {})
-        prev_ctx = ctx.get("prev", [])
-        next_ctx = ctx.get("next", [])
-        if prev_ctx:
-            lines.append(f"- context_prev: {' | '.join(prev_ctx)}")
-        if next_ctx:
-            lines.append(f"- context_next: {' | '.join(next_ctx)}")
-
-        frames = scene.get("frame_paths", [])
-        if frames:
-            lines.append(f"- frame_count: {len(frames)}")
-        lines.append("")
-    return "\n".join(lines)
+STYLE_GUIDE = {
+    "documentary": "客观、简洁、偏纪录片口吻，少夸张。",
+    "short_drama": "更有悬念感和戏剧张力，但不能改事实。",
+    "default": "自然口语化，信息清楚，避免空话。",
+}
 
 
-FACT_PROMPT_TEMPLATE = """
-请阅读下面的视频片段证据包，先做事实抽取，不要直接写花哨文案。
-
-要求：
-1. 每个 scene 输出一条 facts 记录。
-2. 仅基于字幕和画面证据，不要脑补不存在的细节。
-3. 如果有字幕，优先以字幕为准；画面只做补充。
-4. 每段 fact 描述必须控制在对应的字数上限内（如有标注），宁可精炼也不要超出。
-5. 输出 JSON，格式如下：
-{{
-  "items": [
-    {{
-      "scene_id": "scene_001",
-      "timestamp": "00:00:00,000-00:00:03,000",
-      "char_budget": 20,
-      "picture": "用一句话概括这一段画面与动作",
-      "fact": "用一句话概括这一段真实发生了什么"
-    }}
-  ]
-}}
+FACTS_PROMPT = """
+你是影视事实记录员。严格基于证据写一句解说，不要脑补。
 
 证据包：
-__SCENE_MARKDOWN__
-"""
+{evidence_json}
 
-POLISH_PROMPT_TEMPLATE = """
-你将收到一组事实版视频解说片段，请把它们改写成适合短视频解说的文案。
+剧情理解：
+{understanding_json}
 
-要求：
-1. 保留原时间戳，不新增事实。
-2. narration 要简洁、准确、有一点吸引力，但不要浮夸。
-3. 每段 narration 必须严格控制在对应的字数上限（char_budget）内，宁可精炼也不要超出。
-4. picture 保留为画面概括。
-5. 输出 JSON，格式如下：
-{{
-  "items": [
-    {{
-      "_id": 1,
-      "timestamp": "00:00:00,000-00:00:03,000",
-      "char_budget": 20,
-      "picture": "...",
-      "narration": "..."
-    }}
-  ]
-}}
-
-事实版数据：
-__FACT_JSON__
-"""
-
-
-# ============ 短剧风格的 Prompt 模板 ============
-SHORT_DRAMA_FACT_PROMPT_TEMPLATE = """
-请阅读下面的视频片段证据包（基于字幕/对白），找出最吸引观众的爆点和转折。
+全局摘要：
+{global_summary}
 
 要求：
-1. 每个 scene 输出一条记录，重点关注：冲突、反转、笑点、高潮。
-2. 仅基于字幕证据，不要脑补不存在的细节。
-3. 标注每段的吸引力等级（高/中/低），高吸引力的段落要重点挖掘戏剧张力。
-4. 每段描述必须控制在对应的字数上限内，宁可精炼也不要超出。
-5. 输出 JSON，格式如下：
-{{
-  "items": [
-    {{
-      "scene_id": "scene_001",
-      "timestamp": "00:00:00,000-00:00:03,000",
-      "char_budget": 20,
-      "attraction_level": "高/中/低",
-      "picture": "用一句话概括这一段画面与动作",
-      "fact": "用一句话概括这一段最吸引人的剧情点"
-    }}
-  ]
-}}
+1. 只写眼前片段已经能确认的事实
+2. 不得虚构人物动机、道具、地点
+3. 尽量保留关键动作、关系变化、对白信息
+4. 控制在 {char_budget} 字内
+5. 只输出一句中文，不要解释
+""".strip()
 
-证据包：
-__SCENE_MARKDOWN__
-"""
 
-SHORT_DRAMA_POLISH_PROMPT_TEMPLATE = """
-你将收到一组短剧爆点分析，请改写成适合短视频解说的文案。
+POLISH_PROMPT = """
+你是影视解说文案编辑。把下面这句事实解说改成更适合口播的版本。
+
+事实句：{fact_narration}
+风格：{style_guide}
+情绪：{emotion}
+字数上限：{char_budget}
 
 要求：
-1. 风格：悬念感、节奏快、口语化，像在给朋友讲一个精彩故事。
-2. 高吸引力片段重点渲染，低吸引力片段精简概括。
-3. 可以适当加入问句制造悬念，但不要过度夸张。
-4. 每段 narration 严格控制在字数上限内，宁可精炼也不要超出。
-5. picture 保留为画面概括。
-6. 输出 JSON，格式如下：
-{{
-  "items": [
-    {{
-      "_id": 1,
-      "timestamp": "00:00:00,000-00:00:03,000",
-      "char_budget": 20,
-      "attraction_level": "高/中/低",
-      "picture": "...",
-      "narration": "..."
-    }}
-  ]
-}}
-
-事实版数据：
-__FACT_JSON__
-"""
+1. 不改事实、不改时间顺序
+2. 可以更顺口、更有钩子，但不要空泛
+3. 如果证据置信度较低，请用保守表达
+4. 只输出一句中文，不要解释
+""".strip()
 
 
-def generate_narration(markdown_content, api_key, base_url, model):
+
+def _call_chat_completion(prompt: str, api_key: str, base_url: str, model: str) -> str:
+    if not requests or not api_key or not base_url or not model:
+        return ""
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url = url + "/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": "你是一个严格、可靠的中文视频解说助手。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
     try:
-        logger.info("使用新的LLM服务架构生成解说文案")
-        result = generate_narration_new(markdown_content, api_key, base_url, model)
-        return result
-    except Exception as e:
-        logger.warning(f"使用新LLM服务失败，回退到旧实现: {str(e)}")
-        return _generate_narration_legacy(markdown_content, api_key, base_url, model)
+        resp = requests.post(url, headers=headers, json=payload, timeout=90)
+        resp.raise_for_status()
+        data = resp.json()
+        return (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+    except Exception as exc:
+        logger.warning("LLM 调用失败，回退规则文案: {}", exc)
+        return ""
+
+
+
+def _fallback_fact(pkg: Dict, char_budget: int) -> str:
+    text = (pkg.get("main_text_evidence") or pkg.get("subtitle_text") or "").strip()
+    if text:
+        return trim_text_to_budget(text, char_budget)
+    visual = pkg.get("visual_summary") or []
+    if visual:
+        desc = "，".join(x.get("desc", "") for x in visual[:2] if x.get("desc"))
+        if desc:
+            return trim_text_to_budget(desc, char_budget)
+    return trim_text_to_budget("画面出现新的变化，剧情继续推进。", char_budget)
+
+
+
+def _fallback_polish(fact: str, pkg: Dict, style: str, char_budget: int) -> str:
+    emotion = pkg.get("emotion_hint") or "平静"
+    if style == "short_drama":
+        if emotion in {"惊讶", "紧张", "恐惧"}:
+            text = f"下一秒气氛骤变，{fact}"
+        else:
+            text = f"镜头一转，{fact}"
+    else:
+        text = fact
+    return trim_text_to_budget(text, char_budget)
+
+
+
+def _build_script_item(idx: int, pkg: Dict, narration: str, picture: str, global_summary: Dict) -> Dict:
+    start = float(pkg.get("start", pkg.get("time_window", [0.0, 0.0])[0]) or 0.0)
+    end = float(pkg.get("end", pkg.get("time_window", [0.0, 0.0])[1]) or 0.0)
+    if end <= start:
+        end = start + 1.0
+    char_budget = pkg.get("char_budget") or estimate_char_budget(end - start)
+    canonical_timestamp = f"{utils.format_time(start)}-{utils.format_time(end)}"
+    item = {
+        "_id": idx,
+        "timestamp": canonical_timestamp,
+        "source_timestamp": pkg.get("timestamp") or canonical_timestamp,
+        "picture": (picture or "").strip()[:50] or "画面推进",
+        "narration": trim_text_to_budget((narration or "").strip(), char_budget),
+        "OST": 2,
+        "evidence_refs": list(pkg.get("subtitle_ids") or []) + [pkg.get("segment_id")],
+        "char_budget": char_budget,
+        "emotion": pkg.get("emotion_hint") or "平静",
+        "segment_id": pkg.get("segment_id"),
+        "scene_id": pkg.get("scene_id"),
+        "start": round(start, 3),
+        "end": round(end, 3),
+        "duration": round(end - start, 3),
+        "plot_role": pkg.get("plot_role"),
+        "attraction_level": pkg.get("attraction_level"),
+        "confidence": pkg.get("confidence"),
+        "global_arc": global_summary.get("arc"),
+    }
+    item["fit_check"] = fit_check(item["narration"], end - start)
+    return item
+
 
 
 def generate_narration_from_scene_evidence(
@@ -214,147 +155,66 @@ def generate_narration_from_scene_evidence(
     model: str,
     style: str = "documentary",
 ) -> List[Dict]:
-    """基于场景证据生成解说文案
-
-    Args:
-        scene_evidence: 场景证据列表
-        api_key: API密钥
-        base_url: API基础URL
-        model: 模型名称
-        style: 风格类型，可选 "documentary"（纪录片）或 "short_drama"（短剧）
-
-    Returns:
-        List[Dict]: 生成的脚本片段列表
-    """
     if not scene_evidence:
         return []
-    if not api_key or not model:
-        logger.warning("文本模型配置不完整，回退到本地兜底脚本")
-        return _fallback_from_scene_evidence(scene_evidence)
 
-    # 根据风格选择 Prompt 模板
-    if style == "short_drama":
-        fact_prompt_template = SHORT_DRAMA_FACT_PROMPT_TEMPLATE
-        polish_prompt_template = SHORT_DRAMA_POLISH_PROMPT_TEMPLATE
-        logger.info(f"使用短剧风格生成解说文案，共 {len(scene_evidence)} 个场景")
-    else:
-        fact_prompt_template = FACT_PROMPT_TEMPLATE
-        polish_prompt_template = POLISH_PROMPT_TEMPLATE
-        logger.info(f"使用纪录片风格生成解说文案，共 {len(scene_evidence)} 个场景")
+    global_summary = {}
+    if scene_evidence and isinstance(scene_evidence[0].get("_global_summary"), dict):
+        global_summary = scene_evidence[0]["_global_summary"]
 
-    try:
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        scene_markdown = scene_evidence_to_markdown(scene_evidence)
-        fact_prompt = fact_prompt_template.replace("__SCENE_MARKDOWN__", scene_markdown)
-        facts_response = _chat_json(client=client, model=model, prompt=fact_prompt)
-        fact_items = facts_response.get("items", []) if isinstance(facts_response, dict) else []
-        if not fact_items:
-            logger.warning("事实版生成为空，回退到本地兜底")
-            return _fallback_from_scene_evidence(scene_evidence)
-
-        fact_json = json.dumps(fact_items, ensure_ascii=False, indent=2)
-        polish_prompt = polish_prompt_template.replace("__FACT_JSON__", fact_json)
-        polish_response = _chat_json(client=client, model=model, prompt=polish_prompt)
-        polished_items = polish_response.get("items", []) if isinstance(polish_response, dict) else []
-        if not polished_items:
-            polished_items = _facts_to_items(fact_items)
-        for idx, item in enumerate(polished_items, start=1):
-            item.setdefault("_id", idx)
-            item.setdefault("OST", 2)
-        return ensure_script_shape(polished_items)
-    except Exception as e:
-        logger.error(f"基于字幕证据生成解说失败 (style={style}): {e}")
-        return _fallback_from_scene_evidence(scene_evidence)
-
-
-def _generate_narration_legacy(markdown_content, api_key, base_url, model):
-    try:
-        prompt = PromptManager.get_prompt(category="documentary", name="narration_generation", parameters={"video_frame_description": markdown_content})
-        client = OpenAI(api_key=api_key, base_url=base_url)
-        if model not in ["deepseek-reasoner"]:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_ROLE},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.9,
-                response_format={"type": "json_object"},
-            )
-            if response.choices:
-                logger.debug(f"消耗的tokens: {response.usage.total_tokens}")
-                return response.choices[0].message.content
-            return "生成解说文案失败: 未获取到有效响应"
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_ROLE},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.9,
+    style_guide = STYLE_GUIDE.get(style, STYLE_GUIDE["default"])
+    script_items: List[Dict] = []
+    for idx, pkg in enumerate(scene_evidence, start=1):
+        start = float(pkg.get("start", pkg.get("time_window", [0.0, 0.0])[0]) or 0.0)
+        end = float(pkg.get("end", pkg.get("time_window", [0.0, 0.0])[1]) or 0.0)
+        duration = max(end - start, 0.1)
+        char_budget = estimate_char_budget(duration)
+        pkg["char_budget"] = char_budget
+        evidence_json = json.dumps(
+            {
+                "main_text_evidence": pkg.get("main_text_evidence"),
+                "visual_summary": pkg.get("visual_summary"),
+                "context_window": pkg.get("context_window"),
+                "confidence": pkg.get("confidence"),
+                "emotion_hint": pkg.get("emotion_hint"),
+                "entities": pkg.get("entities"),
+            },
+            ensure_ascii=False,
         )
-        if response.choices:
-            narration_script = response.choices[0].message.content
-            logger.debug(f"文案消耗的tokens: {response.usage.total_tokens}")
-            return narration_script.replace("```json", "").replace("```", "")
-        return "生成解说文案失败: 未获取到有效响应"
-    except Exception:
-        return f"调用API生成解说文案时出错: {traceback.format_exc()}"
+        fact = _call_chat_completion(
+            FACTS_PROMPT.format(
+                evidence_json=evidence_json,
+                understanding_json=json.dumps(pkg.get("local_understanding") or {}, ensure_ascii=False),
+                global_summary=json.dumps(global_summary or {}, ensure_ascii=False),
+                char_budget=char_budget,
+            ),
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+        )
+        if not fact:
+            fact = _fallback_fact(pkg, char_budget)
+        fact = trim_text_to_budget(fact, char_budget)
 
+        polish_budget = max(char_budget, int(char_budget * 1.1))
+        polished = _call_chat_completion(
+            POLISH_PROMPT.format(
+                fact_narration=fact,
+                style_guide=style_guide,
+                emotion=pkg.get("emotion_hint") or "平静",
+                char_budget=polish_budget,
+            ),
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+        )
+        if not polished:
+            polished = _fallback_polish(fact, pkg, style, polish_budget)
+        if pkg.get("confidence") in {"asr_low", "visual_only"}:
+            polished = polished.replace("一定", "似乎").replace("就是", "像是")
+        picture = pkg.get("picture") or "；".join(
+            x.get("desc", "") for x in (pkg.get("visual_summary") or [])[:2]
+        )
+        script_items.append(_build_script_item(idx, pkg, polished, picture, global_summary or {}))
 
-def _chat_json(client: OpenAI, model: str, prompt: str) -> Dict:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_ROLE},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-        response_format={"type": "json_object"},
-    )
-    content = response.choices[0].message.content if response.choices else "{}"
-    logger.debug(f"LLM tokens: {getattr(response, 'usage', None)}")
-    return _parse_json_text(content)
-
-
-def _parse_json_text(content: str) -> Dict:
-    text = (content or "").strip()
-    if "```json" in text:
-        text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif "```" in text:
-        text = text.split("```", 1)[1].split("```", 1)[0].strip()
-    return json.loads(text)
-
-
-def _fallback_from_scene_evidence(scene_evidence: List[Dict]) -> List[Dict]:
-    items = []
-    for idx, scene in enumerate(scene_evidence or [], start=1):
-        subtitle_text = (scene.get("subtitle_text") or "").strip()
-        visual_summary = (scene.get("visual_summary") or "").strip()
-        picture = visual_summary or subtitle_text or "画面出现新的信息点"
-        if subtitle_text:
-            narration = subtitle_text[:50]
-        else:
-            narration = visual_summary[:40] or "这一段的关键信息已经出现。"
-        items.append({
-            "_id": idx,
-            "timestamp": scene.get("timestamp"),
-            "picture": picture,
-            "narration": narration,
-            "OST": 2,
-        })
-    return ensure_script_shape(items)
-
-
-def _facts_to_items(fact_items: List[Dict]) -> List[Dict]:
-    items = []
-    for idx, item in enumerate(fact_items or [], start=1):
-        narration = item.get("fact") or item.get("picture") or "这一段发生了新的变化。"
-        items.append({
-            "_id": idx,
-            "timestamp": item.get("timestamp"),
-            "picture": item.get("picture", ""),
-            "narration": narration,
-            "OST": 2,
-        })
-    return items
+    return script_items

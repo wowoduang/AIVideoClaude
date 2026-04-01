@@ -1,703 +1,687 @@
-import os
+from __future__ import annotations
+
 import glob
+import hashlib
 import json
+import os
 import time
 import traceback
+
 import streamlit as st
 from loguru import logger
 
 from app.config import config
-from app.models.schema import VideoClipParams
+from app.models.schema import VideoAspect, VideoClipParams
 from app.services.subtitle_text import decode_subtitle_bytes
 from app.services.timeline_allocator import fit_check
-from app.utils import utils, check_script
-from webui.tools.generate_script_docu import generate_script_docu
-from webui.tools.generate_script_short import generate_script_short
+from app.utils import check_script, utils
+from webui.components.subtitle_first_mode_panel import render_subtitle_first_mode_panel
 from webui.tools.generate_short_summary import generate_script_short_sunmmary
 
 
+MODE_FILE = "file_selection"
+MODE_SUBTITLE_FIRST = "summary"
+
+OST_OPTIONS = [0, 1, 2]
+OST_LABELS = {
+    0: "TTS配音",
+    1: "保留原声",
+    2: "TTS+原声混合",
+}
+
+
+def _get_uploaded_file_signature(uploaded_file):
+    if uploaded_file is None:
+        return "", b""
+
+    raw_bytes = uploaded_file.getvalue()
+    digest = hashlib.md5(raw_bytes).hexdigest()
+    return f"{uploaded_file.name}:{len(raw_bytes)}:{digest}", raw_bytes
+
+
+def _build_unique_upload_path(save_dir: str, original_name: str) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+
+    safe_filename = os.path.basename(original_name)
+    file_name, file_extension = os.path.splitext(safe_filename)
+    save_path = os.path.join(save_dir, safe_filename)
+
+    if os.path.exists(save_path):
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        save_path = os.path.join(save_dir, f"{file_name}_{timestamp}{file_extension}")
+
+    return save_path
+
+
+def _clear_upload_cache(*keys: str):
+    for key in keys:
+        st.session_state.pop(key, None)
+
+
+def get_script_params() -> dict:
+    """供 webui.render_generate_button() 合并参数使用，必须返回 mapping。"""
+    return {
+        "video_clip_json": st.session_state.get("video_clip_json", []),
+        "video_clip_json_path": st.session_state.get("video_clip_json_path", ""),
+        "video_origin_path": st.session_state.get("video_origin_path", ""),
+        "video_aspect": st.session_state.get("video_aspect", VideoAspect.portrait.value),
+        "video_language": st.session_state.get("video_language", "zh-CN"),
+        "voice_name": st.session_state.get("voice_name", "zh-CN-YunjianNeural"),
+        "voice_volume": float(st.session_state.get("voice_volume", 1.0)),
+        "voice_rate": float(st.session_state.get("voice_rate", 1.0)),
+        "voice_pitch": float(st.session_state.get("voice_pitch", 1.0)),
+        "tts_engine": st.session_state.get("tts_engine", ""),
+        "bgm_name": st.session_state.get("bgm_name", "random"),
+        "bgm_type": st.session_state.get("bgm_type", "random"),
+        "bgm_file": st.session_state.get("bgm_file", ""),
+        "subtitle_enabled": bool(st.session_state.get("subtitle_enabled", True)),
+        "font_name": st.session_state.get("font_name", "SimHei"),
+        "font_size": int(st.session_state.get("font_size", 36)),
+        "text_fore_color": st.session_state.get("text_fore_color", "white"),
+        "text_back_color": st.session_state.get("text_back_color"),
+        "stroke_color": st.session_state.get("stroke_color", "black"),
+        "stroke_width": float(st.session_state.get("stroke_width", 1.5)),
+        "subtitle_position": st.session_state.get("subtitle_position", "bottom"),
+        "custom_position": float(st.session_state.get("custom_position", 70.0)),
+        "n_threads": int(st.session_state.get("n_threads", 16)),
+        "tts_volume": float(st.session_state.get("tts_volume", 1.0)),
+        "original_volume": float(st.session_state.get("original_volume", 1.2)),
+        "bgm_volume": float(st.session_state.get("bgm_volume", 0.3)),
+    }
+
+
 def render_script_panel(tr):
-    """渲染脚本配置面板"""
     with st.container(border=True):
         st.write(tr("Video Script Configuration"))
         params = VideoClipParams()
 
-        # 渲染脚本文件选择
+        _normalize_legacy_mode()
         render_script_file(tr, params)
-
-        # 渲染视频文件选择
         render_video_file(tr, params)
 
-        # 获取当前选择的脚本类型
-        script_path = st.session_state.get('video_clip_json_path', '')
+        script_path = st.session_state.get("video_clip_json_path", "")
+        if script_path == MODE_SUBTITLE_FIRST:
+            render_subtitle_first_generate_panel(tr)
 
-        # 根据脚本类型显示不同的布局
-        if script_path == "auto":
-            # 画面解说
-            render_video_details(tr)
-        elif script_path == "short":
-            # 短剧混剪
-            render_short_generate_options(tr)
-        elif script_path == "summary":
-            # 短剧解说
-            short_drama_summary(tr)
-        else:
-            # 默认为空
-            pass
-
-        # 渲染脚本操作按钮
         render_script_buttons(tr, params)
 
 
+def _normalize_legacy_mode():
+    current = st.session_state.get("video_clip_json_path", "")
+    if current in ("auto", "short"):
+        st.session_state["video_clip_json_path"] = MODE_SUBTITLE_FIRST
+
+
 def render_script_file(tr, params):
-    """渲染脚本文件选择"""
-    # 定义功能模式
-    MODE_FILE = "file_selection"
-    MODE_AUTO = "auto"
-    MODE_SHORT = "short"
-    MODE_SUMMARY = "summary"
+    if st.session_state.get("_switch_to_file_mode"):
+        st.session_state["script_mode_selection"] = tr("Select/Upload Script")
+        del st.session_state["_switch_to_file_mode"]
 
-    # 处理保存脚本后的模式切换（必须在 widget 实例化之前）
-    if st.session_state.get('_switch_to_file_mode'):
-        st.session_state['script_mode_selection'] = tr("Select/Upload Script")
-        del st.session_state['_switch_to_file_mode']
-
-    # 模式选项映射
     mode_options = {
         tr("Select/Upload Script"): MODE_FILE,
-        tr("Auto Generate"): MODE_AUTO,
-        tr("Short Generate"): MODE_SHORT,
-        tr("Short Drama Summary"): MODE_SUMMARY,
+        tr("字幕优先生成"): MODE_SUBTITLE_FIRST,
     }
-    
-    # 获取当前状态
-    current_path = st.session_state.get('video_clip_json_path', '')
-    
-    # 确定当前选中的模式索引
-    default_index = 0
+
+    current_path = st.session_state.get("video_clip_json_path", "")
     mode_keys = list(mode_options.keys())
-    
-    if current_path == "auto":
-        default_index = mode_keys.index(tr("Auto Generate"))
-    elif current_path == "short":
-        default_index = mode_keys.index(tr("Short Generate"))
-    elif current_path == "summary":
-        default_index = mode_keys.index(tr("Short Drama Summary"))
+
+    if current_path == MODE_SUBTITLE_FIRST:
+        default_index = mode_keys.index(tr("字幕优先生成"))
     else:
         default_index = mode_keys.index(tr("Select/Upload Script"))
 
-    # 1. 渲染功能选择下拉框
-    # 使用 segmented_control 替代 selectbox，提供更好的视觉体验
     default_mode_label = mode_keys[default_index]
-    
-    # 定义回调函数来处理状态更新
+
     def update_script_mode():
-        # 获取当前选中的标签
         selected_label = st.session_state.script_mode_selection
         if selected_label:
-            # 更新实际的 path 状态
             new_mode = mode_options[selected_label]
-            st.session_state.video_clip_json_path = new_mode
+            st.session_state["video_clip_json_path"] = new_mode
             params.video_clip_json_path = new_mode
         else:
-            # 如果用户取消选择（segmented_control 允许取消），恢复到默认或上一个状态
-            # 这里我们强制保持当前状态，或者重置为默认
-            st.session_state.script_mode_selection = default_mode_label
+            st.session_state["script_mode_selection"] = default_mode_label
 
-    # 渲染组件
     selected_mode_label = st.segmented_control(
-        tr("Video Type"),
+        tr("脚本来源"),
         options=mode_keys,
         default=default_mode_label,
         key="script_mode_selection",
-        on_change=update_script_mode
+        on_change=update_script_mode,
     )
-    
-    # 处理未选择的情况（虽然有default，但在某些交互下可能为空）
+
     if not selected_mode_label:
         selected_mode_label = default_mode_label
-        
+
     selected_mode = mode_options[selected_mode_label]
 
-    # 2. 根据选择的模式处理逻辑
     if selected_mode == MODE_FILE:
-        # --- 文件选择模式 ---
-        script_list = [
-            (tr("None"), ""),
-            (tr("Upload Script"), "upload_script")
-        ]
-
-        # 获取已有脚本文件
-        suffix = "*.json"
+        script_list = [(tr("None"), ""), (tr("Upload Script"), "upload_script")]
         script_dir = utils.script_dir()
-        files = glob.glob(os.path.join(script_dir, suffix))
-        file_list = []
-
-        for file in files:
-            file_list.append({
-                "name": os.path.basename(file),
-                "file": file,
-                "ctime": os.path.getctime(file)
-            })
-
+        files = glob.glob(os.path.join(script_dir, "*.json"))
+        file_list = [
+            {"name": os.path.basename(file), "file": file, "ctime": os.path.getctime(file)}
+            for file in files
+        ]
         file_list.sort(key=lambda x: x["ctime"], reverse=True)
-        for file in file_list:
-            display_name = file['file'].replace(config.root_dir, "")
-            script_list.append((display_name, file['file']))
 
-        # 找到保存的脚本文件在列表中的索引
-        # 如果当前path是特殊值(auto/short/summary)，则重置为空
-        saved_script_path = current_path if current_path not in [MODE_AUTO, MODE_SHORT, MODE_SUMMARY] else ""
-        
+        for file in file_list:
+            display_name = file["file"].replace(config.root_dir, "")
+            script_list.append((display_name, file["file"]))
+
+        saved_script_path = current_path if current_path not in (MODE_SUBTITLE_FIRST, MODE_FILE) else ""
         selected_index = 0
         for i, (_, path) in enumerate(script_list):
             if path == saved_script_path:
                 selected_index = i
                 break
 
-        # 如果找到了保存的脚本，同步更新 selectbox 的 key 状态
-        if saved_script_path and selected_index > 0:
-            st.session_state['script_file_selection'] = selected_index
-
         selected_script_index = st.selectbox(
             tr("Script Files"),
             index=selected_index,
             options=range(len(script_list)),
             format_func=lambda x: script_list[x][0],
-            key="script_file_selection"
+            key="script_file_selection",
         )
 
         script_path = script_list[selected_script_index][1]
-        # 只有当用户实际选择了脚本时才更新路径，避免覆盖已保存的路径
         if script_path:
-            st.session_state['video_clip_json_path'] = script_path
+            st.session_state["video_clip_json_path"] = script_path
             params.video_clip_json_path = script_path
         elif saved_script_path:
-            # 如果用户选择了 "None" 但之前有保存的脚本，保持原有路径
-            st.session_state['video_clip_json_path'] = saved_script_path
+            st.session_state["video_clip_json_path"] = saved_script_path
             params.video_clip_json_path = saved_script_path
 
-        # 处理脚本上传
         if script_path == "upload_script":
             uploaded_file = st.file_uploader(
                 tr("Upload Script File"),
                 type=["json"],
                 accept_multiple_files=False,
+                key="upload_script_file",
             )
-
             if uploaded_file is not None:
                 try:
-                    # 读取上传的JSON内容并验证格式
-                    script_content = uploaded_file.read().decode('utf-8')
-                    json_data = json.loads(script_content)
+                    upload_sig, raw_bytes = _get_uploaded_file_signature(uploaded_file)
+                    cached_sig = st.session_state.get("upload_script_file_sig", "")
+                    cached_path = st.session_state.get("upload_script_saved_path", "")
 
-                    # 保存到脚本目录
-                    safe_filename = os.path.basename(uploaded_file.name)
-                    script_file_path = os.path.join(script_dir, safe_filename)
-                    file_name, file_extension = os.path.splitext(safe_filename)
+                    if upload_sig == cached_sig and cached_path and os.path.exists(cached_path):
+                        st.session_state["video_clip_json_path"] = cached_path
+                        params.video_clip_json_path = cached_path
+                    else:
+                        script_content = raw_bytes.decode("utf-8")
+                        json_data = json.loads(script_content)
+                        script_file_path = _build_unique_upload_path(script_dir, uploaded_file.name)
 
-                    # 如果文件已存在,添加时间戳
-                    if os.path.exists(script_file_path):
-                        timestamp = time.strftime("%Y%m%d%H%M%S")
-                        file_name_with_timestamp = f"{file_name}_{timestamp}"
-                        script_file_path = os.path.join(script_dir, file_name_with_timestamp + file_extension)
+                        with open(script_file_path, "w", encoding="utf-8") as f:
+                            json.dump(json_data, f, ensure_ascii=False, indent=2)
 
-                    # 写入文件
-                    with open(script_file_path, "w", encoding='utf-8') as f:
-                        json.dump(json_data, f, ensure_ascii=False, indent=2)
-
-                    # 更新状态
-                    st.success(tr("Script Uploaded Successfully"))
-                    st.session_state['video_clip_json_path'] = script_file_path
-                    params.video_clip_json_path = script_file_path
-                    time.sleep(1)
-                    st.rerun()
-
+                        st.session_state["upload_script_file_sig"] = upload_sig
+                        st.session_state["upload_script_saved_path"] = script_file_path
+                        st.session_state["video_clip_json_path"] = script_file_path
+                        params.video_clip_json_path = script_file_path
+                        st.success(tr("Script Uploaded Successfully"))
+                        time.sleep(1)
+                        st.rerun()
                 except json.JSONDecodeError:
                     st.error(tr("Invalid JSON format"))
                 except Exception as e:
                     st.error(f"{tr('Upload failed')}: {str(e)}")
+                    logger.error(traceback.format_exc())
+            else:
+                _clear_upload_cache("upload_script_file_sig", "upload_script_saved_path")
     else:
-        # --- 功能生成模式 ---
-        st.session_state['video_clip_json_path'] = selected_mode
-        params.video_clip_json_path = selected_mode
+        st.session_state["video_clip_json_path"] = MODE_SUBTITLE_FIRST
+        params.video_clip_json_path = MODE_SUBTITLE_FIRST
 
 
 def render_video_file(tr, params):
-    """渲染视频文件选择"""
-    video_list = [(tr("None"), ""), (tr("Upload Local Files"), "upload_local")]
+    source_options = {
+        tr("选择已有视频"): "existing_video",
+        tr("上传新视频"): "upload_video",
+    }
 
-    # 获取已有视频文件
-    for suffix in ["*.mp4", "*.mov", "*.avi", "*.mkv"]:
-        video_files = glob.glob(os.path.join(utils.video_dir(), suffix))
-        for file in video_files:
-            display_name = file.replace(config.root_dir, "")
-            video_list.append((display_name, file))
-
-    selected_video_index = st.selectbox(
-        tr("Video File"),
-        index=0,
-        options=range(len(video_list)),
-        format_func=lambda x: video_list[x][0]
+    current_video_path = st.session_state.get("video_origin_path", "")
+    default_video_source = (
+        tr("选择已有视频") if current_video_path not in ("upload_local", "") else tr("上传新视频")
     )
 
-    video_path = video_list[selected_video_index][1]
-    st.session_state['video_origin_path'] = video_path
-    params.video_origin_path = video_path
+    selected_video_source = st.segmented_control(
+        tr("视频来源"),
+        options=list(source_options.keys()),
+        default=default_video_source,
+        key="video_source_selection",
+    )
 
-    if video_path == "upload_local":
+    if not selected_video_source:
+        selected_video_source = default_video_source
+
+    source_mode = source_options[selected_video_source]
+
+    if source_mode == "existing_video":
+        video_list = [(tr("None"), "")]
+        for suffix in ["*.mp4", "*.mov", "*.avi", "*.mkv", "*.flv"]:
+            for file in glob.glob(os.path.join(utils.video_dir(), suffix)):
+                display_name = file.replace(config.root_dir, "")
+                video_list.append((display_name, file))
+
+        saved_video_path = current_video_path if current_video_path not in ("", "upload_local") else ""
+        selected_index = 0
+        for i, (_, path) in enumerate(video_list):
+            if path == saved_video_path:
+                selected_index = i
+                break
+
+        selected_video_index = st.selectbox(
+            tr("已有视频文件"),
+            index=selected_index,
+            options=range(len(video_list)),
+            format_func=lambda x: video_list[x][0],
+            key="existing_video_selection",
+        )
+
+        video_path = video_list[selected_video_index][1]
+        st.session_state["video_origin_path"] = video_path
+        params.video_origin_path = video_path
+
+    else:
         uploaded_file = st.file_uploader(
-            tr("Upload Local Files"),
+            tr("上传视频文件"),
             type=["mp4", "mov", "avi", "flv", "mkv"],
             accept_multiple_files=False,
+            key="upload_video_file",
         )
-
         if uploaded_file is not None:
-            safe_filename = os.path.basename(uploaded_file.name)
-            video_file_path = os.path.join(utils.video_dir(), safe_filename)
-            file_name, file_extension = os.path.splitext(safe_filename)
+            upload_sig, raw_bytes = _get_uploaded_file_signature(uploaded_file)
+            cached_sig = st.session_state.get("upload_video_file_sig", "")
+            cached_path = st.session_state.get("upload_video_saved_path", "")
 
-            if os.path.exists(video_file_path):
-                timestamp = time.strftime("%Y%m%d%H%M%S")
-                file_name_with_timestamp = f"{file_name}_{timestamp}"
-                video_file_path = os.path.join(utils.video_dir(), file_name_with_timestamp + file_extension)
+            if upload_sig == cached_sig and cached_path and os.path.exists(cached_path):
+                st.session_state["video_origin_path"] = cached_path
+                params.video_origin_path = cached_path
+            else:
+                video_file_path = _build_unique_upload_path(utils.video_dir(), uploaded_file.name)
+                with open(video_file_path, "wb") as f:
+                    f.write(raw_bytes)
 
-            with open(video_file_path, "wb") as f:
-                f.write(uploaded_file.read())
-                st.success(tr("File Uploaded Successfully"))
-                st.session_state['video_origin_path'] = video_file_path
+                st.session_state["upload_video_file_sig"] = upload_sig
+                st.session_state["upload_video_saved_path"] = video_file_path
+                st.session_state["video_origin_path"] = video_file_path
                 params.video_origin_path = video_file_path
+                st.success(tr("File Uploaded Successfully"))
                 time.sleep(1)
                 st.rerun()
+        else:
+            cached_path = st.session_state.get("upload_video_saved_path", "")
+            if cached_path and os.path.exists(cached_path):
+                st.session_state["video_origin_path"] = cached_path
+                params.video_origin_path = cached_path
+            else:
+                _clear_upload_cache("upload_video_file_sig", "upload_video_saved_path")
+                st.session_state["video_origin_path"] = ""
+                params.video_origin_path = ""
 
 
-def render_short_generate_options(tr):
-    """
-    渲染Short Generate模式下的特殊选项
-    在Short Generate模式下，替换原有的输入框为自定义片段选项
-    """
-    short_drama_summary(tr)
-    # 显示自定义片段数量选择器
-    custom_clips = st.number_input(
-        tr("自定义片段"),
-        min_value=1,
-        max_value=20,
-        value=st.session_state.get('custom_clips', 5),
-        help=tr("设置需要生成的短视频片段数量"),
-        key="custom_clips_input"
+def render_subtitle_first_generate_panel(tr):
+    if "subtitle_file_processed" not in st.session_state:
+        st.session_state["subtitle_file_processed"] = False
+    if "subtitle_source_mode" not in st.session_state:
+        st.session_state["subtitle_source_mode"] = "existing_subtitle"
+
+    st.caption("subtitle-ui-version: v_auto_subtitle_3buttons_ostfix")
+
+    subtitle_source_options = {
+        tr("选择已有字幕"): "existing_subtitle",
+        tr("上传新字幕"): "upload_subtitle",
+        tr("自动生成字幕"): "auto_subtitle",
+    }
+
+    current_subtitle_path = st.session_state.get("subtitle_path", "")
+    default_subtitle_source = st.session_state.get("subtitle_source_mode", "existing_subtitle")
+    if default_subtitle_source not in subtitle_source_options.values():
+        default_subtitle_source = "existing_subtitle"
+
+    default_label = None
+    for label, value in subtitle_source_options.items():
+        if value == default_subtitle_source:
+            default_label = label
+            break
+    if default_label is None:
+        default_label = tr("选择已有字幕")
+
+    selected_subtitle_source = st.segmented_control(
+        tr("字幕来源"),
+        options=list(subtitle_source_options.keys()),
+        default=default_label,
+        key="subtitle_source_selection",
     )
-    st.session_state['custom_clips'] = custom_clips
 
+    if not selected_subtitle_source:
+        selected_subtitle_source = default_label
 
-def render_video_details(tr):
-    """画面解说 渲染视频主题和提示词"""
-    video_theme = st.text_input(tr("Video Theme"))
-    custom_prompt = st.text_area(
-        tr("Generation Prompt"),
-        value=st.session_state.get('video_plot', ''),
-        help=tr("Custom prompt for LLM, leave empty to use default prompt"),
-        height=180
-    )
-    # 非短视频模式下显示原有的三个输入框
-    input_cols = st.columns(2)
+    subtitle_source_mode = subtitle_source_options[selected_subtitle_source]
+    st.session_state["subtitle_source_mode"] = subtitle_source_mode
 
-    with input_cols[0]:
-        st.number_input(
-            tr("Frame Interval (seconds)"),
-            min_value=0,
-            value=st.session_state.get('frame_interval_input', config.frames.get('frame_interval_input', 3)),
-            help=tr("Frame Interval (seconds) (More keyframes consume more tokens)"),
-            key="frame_interval_input"
+    if subtitle_source_mode == "existing_subtitle":
+        subtitle_list = [(tr("None"), "")]
+        subtitle_dir = utils.subtitle_dir() if hasattr(utils, "subtitle_dir") else utils.temp_dir()
+        subtitle_files = []
+        for suffix in ["*.srt", "*.ass", "*.ssa", "*.vtt"]:
+            for file in glob.glob(os.path.join(subtitle_dir, suffix)):
+                subtitle_files.append(file)
+
+        subtitle_files = sorted(set(subtitle_files), key=lambda x: os.path.getctime(x), reverse=True)
+        for file in subtitle_files:
+            display_name = file.replace(config.root_dir, "")
+            subtitle_list.append((display_name, file))
+
+        fallback_recent_generated = st.session_state.get("last_generated_subtitle_path", "")
+        saved_subtitle_path = current_subtitle_path if current_subtitle_path and os.path.exists(current_subtitle_path) else ""
+        if not saved_subtitle_path and fallback_recent_generated and os.path.exists(fallback_recent_generated):
+            saved_subtitle_path = fallback_recent_generated
+        selected_index = 0
+        for i, (_, path) in enumerate(subtitle_list):
+            if path == saved_subtitle_path:
+                selected_index = i
+                break
+
+        selected_subtitle_index = st.selectbox(
+            tr("已有字幕文件"),
+            index=selected_index,
+            options=range(len(subtitle_list)),
+            format_func=lambda x: subtitle_list[x][0],
+            key="existing_subtitle_selection",
         )
 
-    with input_cols[1]:
-        st.number_input(
-            tr("Batch Size"),
-            min_value=0,
-            value=st.session_state.get('vision_batch_size', config.frames.get('vision_batch_size', 10)),
-            help=tr("Batch Size (More keyframes consume more tokens)"),
-            key="vision_batch_size"
+        subtitle_path = subtitle_list[selected_subtitle_index][1]
+        if subtitle_path:
+            st.session_state["subtitle_path"] = subtitle_path
+            st.session_state["subtitle_file_processed"] = True
+            try:
+                with open(subtitle_path, "rb") as f:
+                    decoded = decode_subtitle_bytes(f.read())
+                st.session_state["subtitle_content"] = decoded.text
+                st.info(f"{tr('已选择字幕文件')}: {os.path.basename(subtitle_path)}")
+            except Exception as e:
+                st.error(f"{tr('读取字幕失败')}: {str(e)}")
+        else:
+            st.session_state["subtitle_path"] = ""
+            st.session_state["subtitle_content"] = None
+            st.session_state["subtitle_file_processed"] = False
+
+    elif subtitle_source_mode == "upload_subtitle":
+        subtitle_file = st.file_uploader(
+            tr("上传字幕文件"),
+            type=["srt", "ass", "ssa", "vtt"],
+            accept_multiple_files=False,
+            key="subtitle_file_uploader",
         )
-    st.session_state['video_theme'] = video_theme
-    st.session_state['custom_prompt'] = custom_prompt
-    return video_theme, custom_prompt
 
+        if subtitle_file is not None:
+            try:
+                upload_sig, raw_bytes = _get_uploaded_file_signature(subtitle_file)
+                cached_sig = st.session_state.get("subtitle_upload_file_sig", "")
+                cached_path = st.session_state.get("subtitle_upload_file_path", "")
 
-def short_drama_summary(tr):
-    """短剧解说 渲染视频主题和提示词"""
-    # 检查是否已经处理过字幕文件
-    if 'subtitle_file_processed' not in st.session_state:
-        st.session_state['subtitle_file_processed'] = False
-    
-    subtitle_file = st.file_uploader(
-        tr("上传字幕文件"),
-        type=["srt", "ass", "ssa", "vtt"],
-        accept_multiple_files=False,
-        key="subtitle_file_uploader"  # 添加唯一key
+                if upload_sig == cached_sig and cached_path and os.path.exists(cached_path):
+                    st.session_state["subtitle_path"] = cached_path
+                    st.session_state["subtitle_file_processed"] = True
+                    if not st.session_state.get("subtitle_content"):
+                        with open(cached_path, "r", encoding="utf-8") as f:
+                            st.session_state["subtitle_content"] = f.read()
+                else:
+                    decoded = decode_subtitle_bytes(raw_bytes)
+                    subtitle_content = decoded.text
+                    detected_encoding = decoded.encoding
+
+                    if not subtitle_content:
+                        st.error(tr("无法读取字幕文件，请检查文件编码（支持 UTF-8、UTF-16、GBK、GB2312）"))
+                        st.stop()
+
+                    subtitle_dir = utils.subtitle_dir() if hasattr(utils, "subtitle_dir") else utils.temp_dir()
+                    subtitle_file_path = _build_unique_upload_path(subtitle_dir, subtitle_file.name)
+
+                    with open(subtitle_file_path, "w", encoding="utf-8") as f:
+                        f.write(subtitle_content)
+
+                    st.session_state["subtitle_upload_file_sig"] = upload_sig
+                    st.session_state["subtitle_upload_file_path"] = subtitle_file_path
+                    st.session_state["subtitle_path"] = subtitle_file_path
+                    st.session_state["subtitle_content"] = subtitle_content
+                    st.session_state["subtitle_file_processed"] = True
+
+                    st.success(
+                        f"{tr('已获得字幕，进入字幕优先模式')} "
+                        f"(编码: {detected_encoding.upper()}, 大小: {len(subtitle_content)} 字符)"
+                    )
+            except Exception as e:
+                st.error(f"{tr('Upload failed')}: {str(e)}")
+                logger.error(traceback.format_exc())
+        else:
+            cached_path = st.session_state.get("subtitle_upload_file_path", "")
+            if cached_path and os.path.exists(cached_path):
+                st.session_state["subtitle_path"] = cached_path
+                st.session_state["subtitle_file_processed"] = True
+            else:
+                st.session_state["subtitle_file_processed"] = False
+                _clear_upload_cache("subtitle_upload_file_sig", "subtitle_upload_file_path")
+
+    else:
+        st.session_state["subtitle_path"] = ""
+        st.session_state["subtitle_content"] = None
+        st.session_state["subtitle_file_processed"] = False
+        st.info(tr("将根据视频自动生成字幕，然后再生成解说脚本。"))
+        recent_generated = st.session_state.get("last_generated_subtitle_path", "")
+        if recent_generated and os.path.exists(recent_generated):
+            st.caption(f"最近自动生成字幕: {os.path.basename(recent_generated)}")
+
+    if st.session_state.get("subtitle_path") or subtitle_source_mode == "auto_subtitle":
+        render_subtitle_first_mode_panel(tr)
+
+    st.text_input(
+        tr("短剧名称"),
+        value=st.session_state.get("short_name", ""),
+        key="short_name",
     )
-    
-    # 显示当前已上传的字幕文件路径
-    if 'subtitle_path' in st.session_state and st.session_state['subtitle_path']:
-        st.info(f"已上传字幕: {os.path.basename(st.session_state['subtitle_path'])}")
-        if st.button(tr("清除已上传字幕")):
-            st.session_state['subtitle_path'] = None
-            st.session_state['subtitle_content'] = None
-            st.session_state['subtitle_file_processed'] = False
-            st.rerun()
-    
-    # 只有当有文件上传且尚未处理时才执行处理逻辑
-    if subtitle_file is not None and not st.session_state['subtitle_file_processed']:
-        try:
-            # 清理文件名，防止路径污染和路径遍历攻击
-            safe_filename = os.path.basename(subtitle_file.name)
 
-            decoded = decode_subtitle_bytes(subtitle_file.getvalue())
-            script_content = decoded.text
-            detected_encoding = decoded.encoding
-
-            if not script_content:
-                st.error(tr("无法读取字幕文件，请检查文件编码（支持 UTF-8、UTF-16、GBK、GB2312）"))
-                st.stop()
-
-            # 验证字幕内容（简单检查）
-            if len(script_content.strip()) < 10:
-                st.warning(tr("字幕文件内容似乎为空，请检查文件"))
-
-            # 保存到字幕目录
-            script_file_path = os.path.join(utils.subtitle_dir(), safe_filename)
-            file_name, file_extension = os.path.splitext(safe_filename)
-
-            # 如果文件已存在,添加时间戳
-            if os.path.exists(script_file_path):
-                timestamp = time.strftime("%Y%m%d%H%M%S")
-                file_name_with_timestamp = f"{file_name}_{timestamp}"
-                script_file_path = os.path.join(utils.subtitle_dir(), file_name_with_timestamp + file_extension)
-
-            # 直接写入SRT内容（统一使用 UTF-8）
-            with open(script_file_path, "w", encoding='utf-8') as f:
-                f.write(script_content)
-
-            # 更新状态
-            st.success(
-                f"{tr('字幕上传成功')} "
-                f"(编码: {detected_encoding.upper()}, "
-                f"大小: {len(script_content)} 字符)"
-            )
-            st.session_state['subtitle_path'] = script_file_path
-            st.session_state['subtitle_content'] = script_content
-            st.session_state['subtitle_file_processed'] = True  # 标记已处理
-
-            # 避免使用rerun，使用更新状态的方式
-            # st.rerun()
-
-        except Exception as e:
-            st.error(f"{tr('Upload failed')}: {str(e)}")
-
-    # 名称输入框
-    video_theme = st.text_input(tr("短剧名称"))
-    st.session_state['video_theme'] = video_theme
-    # 数字输入框
-    temperature = st.slider("temperature", 0.0, 2.0, 0.7)
-    st.session_state['temperature'] = temperature
-    return video_theme
+    st.slider(
+        "temperature",
+        0.0,
+        2.0,
+        float(st.session_state.get("temperature", 0.7)),
+        key="temperature",
+    )
 
 
 def render_script_buttons(tr, params):
-    """渲染脚本操作按钮"""
-    # 获取当前选择的脚本类型
-    script_path = st.session_state.get('video_clip_json_path', '')
+    script_path = st.session_state.get("video_clip_json_path", "")
 
-    # 生成/加载按钮
-    if script_path == "auto":
-        button_name = tr("Generate Video Script")
-    elif script_path == "short":
-        button_name = tr("Generate Short Video Script")
-    elif script_path == "summary":
-        button_name = tr("生成短剧解说脚本")
-    elif script_path.endswith("json"):
+    if script_path == MODE_SUBTITLE_FIRST:
+        if st.session_state.get("subtitle_source_mode") == "auto_subtitle":
+            button_name = tr("自动生成字幕并生成解说脚本")
+        else:
+            button_name = tr("生成字幕优先解说脚本")
+    elif isinstance(script_path, str) and script_path.endswith("json"):
         button_name = tr("Load Video Script")
     else:
         button_name = tr("Please Select Script File")
 
     if st.button(button_name, key="script_action", disabled=not script_path):
-        if script_path == "auto":
-            # 执行纪录片视频脚本生成（视频无字幕无配音）
-            generate_script_docu(params)
-        elif script_path == "short":
-            # 执行 短剧混剪 脚本生成
-            custom_clips = st.session_state.get('custom_clips')
-            generate_script_short(tr, params, custom_clips)
-        elif script_path == "summary":
-            # 执行 短剧解说 脚本生成
-            subtitle_path = st.session_state.get('subtitle_path')
-            video_theme = st.session_state.get('video_theme')
-            temperature = st.session_state.get('temperature')
+        if script_path == MODE_SUBTITLE_FIRST:
+            subtitle_mode = st.session_state.get("subtitle_source_mode", "existing_subtitle")
+            subtitle_path = st.session_state.get("subtitle_path", "")
+            if subtitle_mode != "auto_subtitle" and (not subtitle_path or not os.path.exists(subtitle_path)):
+                st.error(tr("字幕文件不存在"))
+                return
+
+            video_theme = st.session_state.get("short_name") or st.session_state.get("video_theme", "")
+            temperature = st.session_state.get("temperature", 0.7)
             generate_script_short_sunmmary(params, subtitle_path, video_theme, temperature)
         else:
             load_script(tr, script_path)
 
-    # ── Evidence preview panel (subtitle-first pipeline) ────────
     _render_evidence_preview(tr)
-
-    # 视频脚本编辑区
     video_clip_json_details = _render_script_editor(tr)
 
-    # 操作按钮行 - 合并格式检查和保存功能
     if st.button(tr("Save Script"), key="save_script", use_container_width=True):
         save_script_with_validation(tr, video_clip_json_details)
 
 
 def _render_evidence_preview(tr):
-    """Render the evidence preview panel with cost estimation and global summary.
+    evidence = st.session_state.get("subtitle_first_evidence", [])
+    global_summary = st.session_state.get("subtitle_first_global_summary", {})
 
-    Only shown when subtitle-first pipeline evidence is available in session.
-    """
-    evidence = st.session_state.get('subtitle_first_evidence', [])
-    global_summary = st.session_state.get('subtitle_first_global_summary', {})
     if not evidence:
         return
 
     with st.expander(tr("Evidence Preview"), expanded=False):
-        # ── Cost estimation ────────────────────────────────────
         total_chars = sum(len(pkg.get("subtitle_text", "")) for pkg in evidence)
-        estimated_tokens = int(total_chars * 1.5)  # rough CJK token estimate
+        estimated_tokens = int(total_chars * 1.5)
+
         st.caption(
-            f"Scenes: {len(evidence)} | "
-            f"Subtitle chars: {total_chars} | "
-            f"Est. input tokens: ~{estimated_tokens}"
+            f"Scenes: {len(evidence)} | Subtitle chars: {total_chars} | Est. tokens: {estimated_tokens}"
         )
 
-        # ── Global summary ─────────────────────────────────────
         if global_summary:
-            arc = global_summary.get("arc", "")
-            summary_text = global_summary.get("summary", "")
-            if arc or summary_text:
-                st.markdown(f"**Arc:** {arc}")
-                if summary_text:
-                    st.markdown(f"**Summary:** {summary_text}")
+            st.write("**Global Summary**")
+            st.json(global_summary)
 
-        # ── Per-segment evidence cards ─────────────────────────
-        for idx, pkg in enumerate(evidence):
-            scene_id = pkg.get("scene_id", idx + 1)
-            ts = pkg.get("timestamp", "")
-            subtitle = pkg.get("subtitle_text", "")[:120]
-            emotion = pkg.get("emotion_hint", "neutral")
-            role = pkg.get("plot_role", "")
-            entities = pkg.get("entities", [])
-
-            label = f"Scene {scene_id}"
-            if ts:
-                label += f" ({ts})"
-            if role:
-                label += f" [{role}]"
-
+        max_items = min(len(evidence), 8)
+        for i, pkg in enumerate(evidence[:max_items], start=1):
+            title = f"#{i} {pkg.get('scene_id', '')} {pkg.get('timestamp', '')}"
             with st.container(border=True):
-                cols = st.columns([3, 1])
-                with cols[0]:
-                    st.markdown(f"**{label}**")
-                    st.caption(subtitle if subtitle else "(no subtitle)")
-                with cols[1]:
-                    if emotion and emotion != "neutral":
-                        st.markdown(f"Emotion: `{emotion}`")
-                    if entities:
-                        st.markdown(f"Entities: {', '.join(entities[:5])}")
+                st.write(title)
+                st.write(pkg.get("subtitle_text", ""))
+                if pkg.get("visual_only"):
+                    st.caption("visual_only")
+                if pkg.get("frame_paths"):
+                    st.caption(f"frames: {len(pkg.get('frame_paths', []))}")
 
 
 def _render_script_editor(tr):
-    """Render the script editor with per-segment lock toggle, fit check, and regen button.
+    video_clip_json = st.session_state.get("video_clip_json", [])
+    if not video_clip_json:
+        return []
 
-    Returns the raw text area value for saving.
-    """
-    script_items = st.session_state.get('video_clip_json', [])
+    st.write(tr("Video Script"))
 
-    # Initialise lock state once
-    if 'script_locks' not in st.session_state:
-        st.session_state['script_locks'] = {}
+    edited_items = []
+    for index, item in enumerate(video_clip_json, start=1):
+        timestamp = item.get("timestamp", "")
+        picture = item.get("picture", "")
+        narration = item.get("narration", "")
+        raw_ost = int(item.get("OST", 2) or 2)
+        if raw_ost not in OST_OPTIONS:
+            raw_ost = 2
 
-    if script_items and isinstance(script_items, list) and len(script_items) > 0:
-        # ── Per-segment interactive editor ─────────────────────
-        edited_items = []
-        for idx, item in enumerate(script_items):
-            seg_id = item.get("_id", idx + 1)
-            is_locked = st.session_state['script_locks'].get(seg_id, False)
-
-            with st.container(border=True):
-                header_cols = st.columns([1, 6, 2, 2])
-                with header_cols[0]:
-                    st.markdown(f"**#{seg_id}**")
-                with header_cols[1]:
-                    st.caption(item.get("timestamp", ""))
-                with header_cols[2]:
-                    # Lock toggle
-                    new_lock = st.checkbox(
-                        "Lock",
-                        value=is_locked,
-                        key=f"lock_cb_{seg_id}",
-                        help="Lock this segment to prevent regeneration",
-                    )
-                    st.session_state['script_locks'][seg_id] = new_lock
-                with header_cols[3]:
-                    # Fit check indicator
-                    narration = item.get("narration", "")
-                    ts = item.get("timestamp", "")
-                    duration = _parse_timestamp_duration(ts)
-                    if duration > 0 and narration:
-                        fc = fit_check(narration, duration)
-                        severity = fc.get("severity", "ok")
-                        if severity == "ok":
-                            st.markdown(":green[OK]")
-                        elif severity == "warn":
-                            st.markdown(f":orange[+{fc.get('overflow', 0)}ch]")
-                        else:
-                            st.markdown(f":red[+{fc.get('overflow', 0)}ch]")
-
-                # Editable narration (disabled when locked)
-                new_narration = st.text_area(
-                    "Narration",
-                    value=item.get("narration", ""),
-                    key=f"narration_{seg_id}",
-                    height=80,
-                    disabled=new_lock,
-                    label_visibility="collapsed",
+        with st.container(border=True):
+            top_cols = st.columns([1, 3, 2])
+            with top_cols[0]:
+                st.write(f"#{index}")
+            with top_cols[1]:
+                st.caption(timestamp)
+            with top_cols[2]:
+                ost_value = st.selectbox(
+                    "OST",
+                    options=OST_OPTIONS,
+                    index=OST_OPTIONS.index(raw_ost),
+                    format_func=lambda x: OST_LABELS.get(x, str(x)),
+                    key=f"ost_{index}",
                 )
 
-                updated_item = dict(item)
-                updated_item["narration"] = new_narration
-                edited_items.append(updated_item)
+            picture_value = st.text_input(
+                tr("Picture Description"),
+                value=picture,
+                key=f"picture_{index}",
+            )
+            narration_value = st.text_area(
+                tr("Narration"),
+                value=narration,
+                height=120,
+                key=f"narration_{index}",
+            )
 
-        # Sync edits back
-        st.session_state['video_clip_json'] = edited_items
+            duration = _estimate_duration_from_timestamp(timestamp)
+            if duration > 0 and int(ost_value) in [0, 2]:
+                fit = fit_check(narration_value, duration)
+                if not fit["fits"]:
+                    st.warning(
+                        f"字数可能超时: budget={fit['budget']}, actual={fit['actual']}, overflow={fit['overflow']}"
+                    )
 
-    # Raw JSON editor (fallback / advanced)
-    video_clip_json_details = st.text_area(
-        tr("Video Script"),
-        value=json.dumps(st.session_state.get('video_clip_json', []), indent=2, ensure_ascii=False),
-        height=500,
-    )
-    return video_clip_json_details
+            edited_item = dict(item)
+            edited_item["picture"] = picture_value
+            edited_item["narration"] = narration_value
+            edited_item["OST"] = int(ost_value)
+            edited_items.append(edited_item)
+
+    st.session_state["video_clip_json"] = edited_items
+    return edited_items
 
 
-def _parse_timestamp_duration(ts: str) -> float:
-    """Parse 'HH:MM:SS,mmm-HH:MM:SS,mmm' and return duration in seconds."""
+def _estimate_duration_from_timestamp(timestamp: str) -> float:
+    if not timestamp or "-" not in timestamp:
+        return 0.0
+
     try:
-        parts = ts.split("-")
-        if len(parts) != 2:
-            return 0.0
-        start = _ts_to_seconds(parts[0].strip())
-        end = _ts_to_seconds(parts[1].strip())
-        return max(end - start, 0.0)
+        start_text, end_text = timestamp.split("-", 1)
+        return _parse_ts(end_text) - _parse_ts(start_text)
     except Exception:
         return 0.0
 
 
-def _ts_to_seconds(ts: str) -> float:
-    """Convert 'HH:MM:SS,mmm' to seconds."""
-    ts = ts.replace(",", ".")
-    parts = ts.split(":")
-    if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-    return 0.0
+def _parse_ts(value: str) -> float:
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) != 3:
+        return 0.0
+    h, m, s = parts
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
 
-def load_script(tr, script_path):
-    """加载脚本文件"""
+def load_script(tr, script_path: str):
     try:
-        with open(script_path, 'r', encoding='utf-8') as f:
-            script = f.read()
-            script = utils.clean_model_output(script)
-            st.session_state['video_clip_json'] = json.loads(script)
-            st.success(tr("Script loaded successfully"))
-            st.rerun()
+        with open(script_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict) and "items" in data:
+            data = data["items"]
+
+        if not isinstance(data, list):
+            st.error(tr("Invalid script format"))
+            return
+
+        st.session_state["video_clip_json"] = data
+        st.success(tr("Script loaded successfully"))
     except Exception as e:
-        logger.error(f"加载脚本文件时发生错误\n{traceback.format_exc()}")
-        st.error(f"{tr('Failed to load script')}: {str(e)}")
+        st.error(f"{tr('Load script failed')}: {str(e)}")
+        logger.error(traceback.format_exc())
 
 
 def save_script_with_validation(tr, video_clip_json_details):
-    """保存视频脚本（包含格式验证）"""
-    if not video_clip_json_details:
-        st.error(tr("请输入视频脚本"))
-        st.stop()
+    try:
+        items = video_clip_json_details or st.session_state.get("video_clip_json", [])
+        if not items:
+            st.warning(tr("No script content to save"))
+            return
 
-    # 第一步：格式验证
-    with st.spinner("正在验证脚本格式..."):
         try:
-            result = check_script.check_format(video_clip_json_details)
-            if not result.get('success'):
-                # 格式验证失败，显示详细错误信息
-                error_message = result.get('message', '未知错误')
-                error_details = result.get('details', '')
-
-                st.error(f"**脚本格式验证失败**")
-                st.error(f"**错误信息：** {error_message}")
-                if error_details:
-                    st.error(f"**详细说明：** {error_details}")
-
-                # 显示正确格式示例
-                st.info("**正确的脚本格式示例：**")
-                example_script = [
-                    {
-                        "_id": 1,
-                        "timestamp": "00:00:00,600-00:00:07,559",
-                        "picture": "工地上，蔡晓艳奋力救人，场面混乱",
-                        "narration": "灾后重建，工地上险象环生！泼辣女工蔡晓艳挺身而出，救人第一！",
-                        "OST": 0
-                    },
-                    {
-                        "_id": 2,
-                        "timestamp": "00:00:08,240-00:00:12,359",
-                        "picture": "领导视察，蔡晓艳不屑一顾",
-                        "narration": "播放原片4",
-                        "OST": 1
-                    }
-                ]
-                st.code(json.dumps(example_script, ensure_ascii=False, indent=2), language='json')
-                st.stop()
-
+            check_script.check_format(items)
         except Exception as e:
-            st.error(f"格式验证过程中发生错误: {str(e)}")
-            st.stop()
+            st.warning(f"{tr('Script format warning')}: {str(e)}")
 
-    # 第二步：保存脚本
-    with st.spinner(tr("Save Script")):
-        script_dir = utils.script_dir()
-        timestamp = time.strftime("%Y-%m%d-%H%M%S")
-        save_path = os.path.join(script_dir, f"{timestamp}.json")
+        output_dir = utils.script_dir()
+        os.makedirs(output_dir, exist_ok=True)
 
-        try:
-            data = json.loads(video_clip_json_details)
-            with open(save_path, 'w', encoding='utf-8') as file:
-                json.dump(data, file, ensure_ascii=False, indent=4)
-                st.session_state['video_clip_json'] = data
-                st.session_state['video_clip_json_path'] = save_path
-                
-                # 标记需要切换到文件选择模式（在下次渲染前处理）
-                st.session_state['_switch_to_file_mode'] = True
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        file_name = f"script_{timestamp}.json"
+        save_path = os.path.join(output_dir, file_name)
 
-                # 更新配置
-                config.app["video_clip_json_path"] = save_path
+        with open(save_path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
 
-                # 显示成功消息
-                st.success("✅ 脚本格式验证通过，保存成功！")
-
-                # 强制重新加载页面更新选择框
-                time.sleep(0.5)  # 给一点时间让用户看到成功消息
-                st.rerun()
-
-        except Exception as err:
-            st.error(f"{tr('Failed to save script')}: {str(err)}")
-            st.stop()
-
-
-# crop_video函数已移除 - 现在使用统一裁剪策略，不再需要预裁剪步骤
-
-
-def get_script_params():
-    """获取脚本参数"""
-    return {
-        'video_language': st.session_state.get('video_language', ''),
-        'video_clip_json_path': st.session_state.get('video_clip_json_path', ''),
-        'video_origin_path': st.session_state.get('video_origin_path', ''),
-        'video_name': st.session_state.get('video_name', ''),
-        'video_plot': st.session_state.get('video_plot', '')
-    }
+        st.session_state["video_clip_json_path"] = save_path
+        st.session_state["_switch_to_file_mode"] = True
+        st.success(f"{tr('Script saved successfully')}: {save_path}")
+    except Exception as e:
+        st.error(f"{tr('Save script failed')}: {str(e)}")
+        logger.error(traceback.format_exc())

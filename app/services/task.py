@@ -24,6 +24,58 @@ from app.services.media_duration import probe_media_duration
 from app.utils import utils
 
 
+def _timestamp_to_seconds_range(timestamp: str):
+    timestamp = str(timestamp or "").strip()
+    if not timestamp or "-" not in timestamp:
+        return None, None
+    try:
+        start_raw, end_raw = timestamp.split("-", 1)
+        start = utils.time_to_seconds(start_raw.strip())
+        end = utils.time_to_seconds(end_raw.strip())
+        if end <= start:
+            return None, None
+        return round(start, 3), round(end, 3)
+    except Exception:
+        return None, None
+
+
+def _normalize_script_item(item, idx: int):
+    new_item = dict(item or {})
+    start = new_item.get("start")
+    end = new_item.get("end")
+    try:
+        start = float(start) if start is not None else None
+        end = float(end) if end is not None else None
+    except Exception:
+        start, end = None, None
+
+    if start is None or end is None or end <= start:
+        ts_start, ts_end = _timestamp_to_seconds_range(new_item.get("timestamp", ""))
+        if ts_start is not None and ts_end is not None:
+            start, end = ts_start, ts_end
+
+    if start is None:
+        start = 0.0
+    if end is None or end <= start:
+        duration_guess = float(new_item.get("duration") or 0)
+        end = start + max(duration_guess, 1.0)
+
+    new_item["start"] = round(float(start), 3)
+    new_item["end"] = round(float(end), 3)
+    new_item["duration"] = round(max(float(end) - float(start), 0.001), 3)
+    new_item["timestamp"] = f"{utils.format_time(start)}-{utils.format_time(end)}"
+    new_item.setdefault("_id", idx)
+    new_item.setdefault("OST", 2)
+    new_item.setdefault("picture", "")
+    return new_item
+
+
+def _normalize_script_list(items):
+    normalized = [_normalize_script_item(item, idx) for idx, item in enumerate(items or [], start=1)]
+    normalized.sort(key=lambda x: (float(x.get("start", 0.0) or 0.0), int(x.get("_id", 0) or 0)))
+    return normalized
+
+
 merged_audio_path = ""
 merged_subtitle_path = ""
 
@@ -37,6 +89,7 @@ def _load_and_prepare_script(video_script_path: str):
         with open(video_script_path, "r", encoding="utf-8") as f:
             list_script = json.load(f)
         list_script = ensure_script_shape(list_script)
+        list_script = _normalize_script_list(list_script)
         validate_script_items(list_script)
         video_ost = [i["OST"] for i in list_script]
         logger.debug(f"解说完整脚本: {' '.join(i['narration'] for i in list_script)}")

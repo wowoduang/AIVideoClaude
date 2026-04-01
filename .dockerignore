@@ -3,6 +3,28 @@
 .gitignore
 .gitattributes
 .svn/
+.github/
+.qoder/
+
+app/models/faster-whisper-large-v2/
+
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.mp3
+*.wav
+*.flac
+*.aac
+*.m4a
+*.srt
+*.ass
+*.vtt
+*.jpg
+*.jpeg
+*.png
+*.gif
 
 # Python 相关
 __pycache__/
@@ -87,6 +109,7 @@ config.toml
 # 资源文件中的大文件
 resource/videos/
 resource/songs/
+resource/
 
 # 测试文件
 tests/

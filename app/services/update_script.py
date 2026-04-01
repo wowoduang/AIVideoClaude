@@ -12,32 +12,26 @@ import re
 import os
 from typing import Dict, List, Any, Tuple, Union
 
+from app.utils import utils
+
 
 def extract_timestamp_from_video_path(video_path: str) -> str:
     """
-    从视频文件路径中提取时间戳
-    
-    Args:
-        video_path: 视频文件路径
-    
-    Returns:
-        提取出的时间戳，格式为 'HH:MM:SS-HH:MM:SS' 或 'HH:MM:SS,sss-HH:MM:SS,sss'
+    从视频文件路径中提取时间戳，统一返回 HH:MM:SS,mmm-HH:MM:SS,mmm。
+    兼容文件名示例：
+    - ost2_vid_00-00-00-000@00-00-20-250.mp4
+    - vid_00-00-00-000@00-00-20-250.mp4
+    - vid-00-00-00-00-00-00.mp4
     """
-    # 使用正则表达式从文件名中提取时间戳
     filename = os.path.basename(video_path)
-    
-    # 匹配新格式: vid_00-00-00-000@00-00-20-250.mp4
-    match_new = re.search(r'vid_(\d{2})-(\d{2})-(\d{2})-(\d{3})@(\d{2})-(\d{2})-(\d{2})-(\d{3})\.mp4', filename)
-    if match_new:
-        # 提取并格式化时间戳（包含毫秒）
-        start_h, start_m, start_s, start_ms = match_new.group(1), match_new.group(2), match_new.group(3), match_new.group(4)
-        end_h, end_m, end_s, end_ms = match_new.group(5), match_new.group(6), match_new.group(7), match_new.group(8)
-        return f"{start_h}:{start_m}:{start_s},{start_ms}-{end_h}:{end_m}:{end_s},{end_ms}"
-    
-    # 匹配旧格式: vid-00-00-00-00-00-00.mp4
+
+    match_precise = re.search(r'vid_(\d{2})-(\d{2})-(\d{2})-(\d{3})@(\d{2})-(\d{2})-(\d{2})-(\d{3})\.mp4', filename)
+    if match_precise:
+        sh, sm, ss, sms, eh, em, es, ems = match_precise.groups()
+        return f"{sh}:{sm}:{ss},{sms}-{eh}:{em}:{es},{ems}"
+
     match_old = re.search(r'vid-(\d{2}-\d{2}-\d{2})-(\d{2}-\d{2}-\d{2})\.mp4', filename)
     if match_old:
-        # 提取并格式化时间戳
         start_time = match_old.group(1).replace('-', ':')
         end_time = match_old.group(2).replace('-', ':')
         return f"{start_time}-{end_time}"
@@ -45,46 +39,31 @@ def extract_timestamp_from_video_path(video_path: str) -> str:
     return ""
 
 
-def calculate_duration(timestamp: str) -> float:
-    """
-    计算时间戳范围的持续时间（秒）
-    
-    Args:
-        timestamp: 格式为 'HH:MM:SS-HH:MM:SS' 或 'HH:MM:SS,sss-HH:MM:SS,sss' 的时间戳
-    
-    Returns:
-        持续时间（秒）
-    """
+def _timestamp_to_seconds_range(timestamp: str):
+    raw = str(timestamp or "").strip()
+    if not raw or '-' not in raw:
+        return None, None
     try:
-        start_time, end_time = timestamp.split('-')
+        start_raw, end_raw = raw.split('-', 1)
+        start = utils.time_to_seconds(start_raw.strip())
+        end = utils.time_to_seconds(end_raw.strip())
+        if end <= start:
+            return None, None
+        return round(start, 3), round(end, 3)
+    except Exception:
+        return None, None
 
-        # 处理毫秒部分
-        if ',' in start_time:
-            start_parts = start_time.split(',')
-            start_time_parts = start_parts[0].split(':')
-            start_ms = float('0.' + start_parts[1]) if len(start_parts) > 1 else 0
-            start_h, start_m, start_s = map(int, start_time_parts)
-        else:
-            start_h, start_m, start_s = map(int, start_time.split(':'))
-            start_ms = 0
 
-        if ',' in end_time:
-            end_parts = end_time.split(',')
-            end_time_parts = end_parts[0].split(':')
-            end_ms = float('0.' + end_parts[1]) if len(end_parts) > 1 else 0
-            end_h, end_m, end_s = map(int, end_time_parts)
-        else:
-            end_h, end_m, end_s = map(int, end_time.split(':'))
-            end_ms = 0
+def _canonical_timestamp_from_seconds(start: float, end: float) -> str:
+    return f"{utils.format_time(start)}-{utils.format_time(end)}"
 
-        # 转换为秒
-        start_seconds = start_h * 3600 + start_m * 60 + start_s + start_ms
-        end_seconds = end_h * 3600 + end_m * 60 + end_s + end_ms
 
-        # 计算时间差（秒）
-        return round(end_seconds - start_seconds, 2)
-    except (ValueError, AttributeError):
+def calculate_duration(timestamp: str) -> float:
+    """计算时间戳范围的持续时间（秒），兼容秒数字符串与 SRT 时间。"""
+    start_seconds, end_seconds = _timestamp_to_seconds_range(timestamp)
+    if start_seconds is None or end_seconds is None:
         return 0.0
+    return round(end_seconds - start_seconds, 3)
 
 
 def update_script_timestamps(
@@ -173,22 +152,18 @@ def update_script_timestamps(
             current_duration = calculate_duration(orig_timestamp)
             item_copy['duration'] = current_duration
             
+        # 规范化原始时间戳/起止秒
+        range_start, range_end = _timestamp_to_seconds_range(item_copy.get('sourceTimeRange', '') or item_copy.get('timestamp', ''))
+        if range_start is not None and range_end is not None:
+            item_copy['timestamp'] = _canonical_timestamp_from_seconds(range_start, range_end)
+            item_copy['start'] = round(range_start, 3)
+            item_copy['end'] = round(range_end, 3)
+
         # 计算片段在成品视频中的时间范围
         if calculate_edited_timerange and current_duration > 0:
             start_time_seconds = accumulated_duration
             end_time_seconds = accumulated_duration + current_duration
-            
-            # 将秒数转换为 HH:MM:SS 格式
-            start_h = int(start_time_seconds // 3600)
-            start_m = int((start_time_seconds % 3600) // 60)
-            start_s = int(start_time_seconds % 60)
-            
-            end_h = int(end_time_seconds // 3600)
-            end_m = int((end_time_seconds % 3600) // 60)
-            end_s = int(end_time_seconds % 60)
-            
-            item_copy['editedTimeRange'] = f"{start_h:02d}:{start_m:02d}:{start_s:02d}-{end_h:02d}:{end_m:02d}:{end_s:02d}"
-            
+            item_copy['editedTimeRange'] = _canonical_timestamp_from_seconds(start_time_seconds, end_time_seconds)
             # 更新累积时长
             accumulated_duration = end_time_seconds
 

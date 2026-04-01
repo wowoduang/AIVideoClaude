@@ -16,61 +16,53 @@ from loguru import logger
 from typing import Dict, List, Optional
 from pathlib import Path
 
-from app.utils import ffmpeg_utils
+from app.utils import ffmpeg_utils, utils
+
+def _split_timestamp(timestamp: str) -> tuple[str, str]:
+    raw = str(timestamp or "").strip()
+    if not raw or "-" not in raw:
+        raise ValueError(f"无效时间戳: {timestamp}")
+    return [part.strip() for part in raw.split("-", 1)]
+
+
+def _timestamp_to_seconds(raw_time: str) -> float:
+    seconds = utils.time_to_seconds(str(raw_time or "").strip())
+    return round(float(seconds or 0.0), 3)
+
+
+def _seconds_to_ffmpeg_time(seconds: float) -> str:
+    return utils.format_time(float(seconds or 0.0)).replace(",", ".")
+
+
+def _seconds_to_safe_token(seconds: float) -> str:
+    ts = utils.format_time(float(seconds or 0.0))
+    return ts.replace(":", "-").replace(",", "-")
+
 
 def parse_timestamp(timestamp: str) -> tuple:
     """
-    解析时间戳字符串，返回开始和结束时间
+    解析时间戳字符串，返回标准化的开始和结束时间。
 
-    Args:
-        timestamp: 格式为'HH:MM:SS-HH:MM:SS'或'HH:MM:SS,sss-HH:MM:SS,sss'的时间戳字符串
-
-    Returns:
-        tuple: (开始时间, 结束时间) 格式为'HH:MM:SS'或'HH:MM:SS,sss'
+    支持输入：
+    - HH:MM:SS-HH:MM:SS
+    - HH:MM:SS,mmm-HH:MM:SS,mmm
+    - 0.000-12.345
     """
-    start_time, end_time = timestamp.split('-')
-    return start_time, end_time
+    start_raw, end_raw = _split_timestamp(timestamp)
+    start_seconds = _timestamp_to_seconds(start_raw)
+    end_seconds = _timestamp_to_seconds(end_raw)
+    if end_seconds <= start_seconds:
+        raise ValueError(f"结束时间必须大于开始时间: {timestamp}")
+    return utils.format_time(start_seconds), utils.format_time(end_seconds)
 
 
 def calculate_end_time(start_time: str, duration: float, extra_seconds: float = 1.0) -> str:
     """
-    根据开始时间和持续时间计算结束时间
-
-    Args:
-        start_time: 开始时间，格式为'HH:MM:SS'或'HH:MM:SS,sss'(带毫秒)
-        duration: 持续时间，单位为秒
-        extra_seconds: 额外添加的秒数，默认为1秒
-
-    Returns:
-        str: 计算后的结束时间，格式与输入格式相同
+    根据开始时间和持续时间计算结束时间，统一返回 HH:MM:SS,mmm。
     """
-    # 检查是否包含毫秒
-    has_milliseconds = ',' in start_time
-    milliseconds = 0
-
-    if has_milliseconds:
-        time_part, ms_part = start_time.split(',')
-        h, m, s = map(int, time_part.split(':'))
-        milliseconds = int(ms_part)
-    else:
-        h, m, s = map(int, start_time.split(':'))
-
-    # 转换为总毫秒数
-    total_milliseconds = ((h * 3600 + m * 60 + s) * 1000 + milliseconds +
-                          int((duration + extra_seconds) * 1000))
-
-    # 计算新的时、分、秒、毫秒
-    ms_new = total_milliseconds % 1000
-    total_seconds = total_milliseconds // 1000
-    h_new = int(total_seconds // 3600)
-    m_new = int((total_seconds % 3600) // 60)
-    s_new = int(total_seconds % 60)
-
-    # 返回与输入格式一致的时间字符串
-    if has_milliseconds:
-        return f"{h_new:02d}:{m_new:02d}:{s_new:02d},{ms_new:03d}"
-    else:
-        return f"{h_new:02d}:{m_new:02d}:{s_new:02d}"
+    start_seconds = _timestamp_to_seconds(start_time)
+    total = start_seconds + max(float(duration or 0.0) + float(extra_seconds or 0.0), 0.0)
+    return utils.format_time(total)
 
 
 def check_hardware_acceleration() -> Optional[str]:
@@ -573,12 +565,12 @@ def _process_narration_only_segment(
     calculated_end_time = calculate_end_time(start_time, duration, extra_seconds=0)
 
     # 转换为FFmpeg兼容的时间格式
-    ffmpeg_start_time = start_time.replace(',', '.')
-    ffmpeg_end_time = calculated_end_time.replace(',', '.')
+    ffmpeg_start_time = _seconds_to_ffmpeg_time(_timestamp_to_seconds(start_time))
+    ffmpeg_end_time = _seconds_to_ffmpeg_time(_timestamp_to_seconds(calculated_end_time))
 
     # 生成输出文件名
-    safe_start_time = start_time.replace(':', '-').replace(',', '-')
-    safe_end_time = calculated_end_time.replace(':', '-').replace(',', '-')
+    safe_start_time = _seconds_to_safe_token(_timestamp_to_seconds(start_time))
+    safe_end_time = _seconds_to_safe_token(_timestamp_to_seconds(calculated_end_time))
     output_filename = f"ost0_vid_{safe_start_time}@{safe_end_time}.mp4"
     output_path = os.path.join(output_dir, output_filename)
 
@@ -616,12 +608,12 @@ def _process_original_audio_segment(
     start_time, end_time = parse_timestamp(timestamp)
 
     # 转换为FFmpeg兼容的时间格式
-    ffmpeg_start_time = start_time.replace(',', '.')
-    ffmpeg_end_time = end_time.replace(',', '.')
+    ffmpeg_start_time = _seconds_to_ffmpeg_time(_timestamp_to_seconds(start_time))
+    ffmpeg_end_time = _seconds_to_ffmpeg_time(_timestamp_to_seconds(end_time))
 
     # 生成输出文件名
-    safe_start_time = start_time.replace(':', '-').replace(',', '-')
-    safe_end_time = end_time.replace(':', '-').replace(',', '-')
+    safe_start_time = _seconds_to_safe_token(_timestamp_to_seconds(start_time))
+    safe_end_time = _seconds_to_safe_token(_timestamp_to_seconds(end_time))
     output_filename = f"ost1_vid_{safe_start_time}@{safe_end_time}.mp4"
     output_path = os.path.join(output_dir, output_filename)
 
@@ -668,12 +660,12 @@ def _process_mixed_segment(
     calculated_end_time = calculate_end_time(start_time, duration, extra_seconds=0)
 
     # 转换为FFmpeg兼容的时间格式
-    ffmpeg_start_time = start_time.replace(',', '.')
-    ffmpeg_end_time = calculated_end_time.replace(',', '.')
+    ffmpeg_start_time = _seconds_to_ffmpeg_time(_timestamp_to_seconds(start_time))
+    ffmpeg_end_time = _seconds_to_ffmpeg_time(_timestamp_to_seconds(calculated_end_time))
 
     # 生成输出文件名
-    safe_start_time = start_time.replace(':', '-').replace(',', '-')
-    safe_end_time = calculated_end_time.replace(':', '-').replace(',', '-')
+    safe_start_time = _seconds_to_safe_token(_timestamp_to_seconds(start_time))
+    safe_end_time = _seconds_to_safe_token(_timestamp_to_seconds(calculated_end_time))
     output_filename = f"ost2_vid_{safe_start_time}@{safe_end_time}.mp4"
     output_path = os.path.join(output_dir, output_filename)
 

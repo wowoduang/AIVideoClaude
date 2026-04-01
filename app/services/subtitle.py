@@ -3,12 +3,19 @@ import os.path
 import re
 import sys
 import traceback
-from typing import Optional, List, Tuple
+import subprocess
+import math
+from typing import Optional, List, Tuple, Dict, Any
 
 try:
     from faster_whisper import WhisperModel
 except Exception:
     WhisperModel = None
+
+try:
+    from funasr import AutoModel as FunASRAutoModel
+except Exception:
+    FunASRAutoModel = None
 
 from timeit import default_timer as timer
 from loguru import logger
@@ -20,21 +27,55 @@ from app.utils import utils
 
 
 model_size = config.whisper.get("model_size", "faster-whisper-large-v3")
+backend_name = str(config.whisper.get("backend", "")).strip().lower()
 device = config.whisper.get("device", "cpu")
 compute_type = config.whisper.get("compute_type", "int8")
 model = None
 _model_identity = None
 
 
-def _base_dirs() -> List[str]:
-    """Return candidate base directories for locating app/models.
+DEFAULT_AUDIO_SAMPLE_RATE = int(config.whisper.get("audio_sample_rate", 16000))
+DEFAULT_AUDIO_CHANNELS = int(config.whisper.get("audio_channels", 1))
+DEFAULT_AUDIO_BITRATE = str(config.whisper.get("audio_bitrate", "32k"))
+DEFAULT_FORCE_LANGUAGE = str(config.whisper.get("language", config.ui.get("language", "zh"))).strip() or None
+DEFAULT_BEAM_SIZE = int(config.whisper.get("beam_size", 1 if str(device).lower() == "cpu" else 5))
+DEFAULT_BEST_OF = int(config.whisper.get("best_of", 1 if str(device).lower() == "cpu" else 3))
+DEFAULT_VAD_MIN_SILENCE_MS = int(config.whisper.get("vad_min_silence_duration_ms", 400))
+DEFAULT_INITIAL_PROMPT = config.whisper.get("initial_prompt", "以下是普通话的人声内容，请准确转写字幕。")
+DEFAULT_AUDIO_FILTER = config.whisper.get(
+    "audio_filter",
+    "highpass=f=120,lowpass=f=3800,volume=1.8",
+)
+DEFAULT_FUNASR_BATCH_SIZE_S = int(config.whisper.get("funasr_batch_size_s", 180))
+DEFAULT_FUNASR_MERGE_LENGTH_S = int(config.whisper.get("funasr_merge_length_s", 15))
+DEFAULT_FUNASR_USE_ITN = bool(config.whisper.get("funasr_use_itn", True))
+DEFAULT_FUNASR_VAD_SEGMENT_MS = int(config.whisper.get("funasr_max_single_segment_time_ms", 30000))
+DEFAULT_FUNASR_VAD_MODEL = str(config.whisper.get("funasr_vad_model", "")).strip()
 
-    In a normal Python environment ``utils.root_dir()`` is sufficient.
-    When the application is compiled / packaged (e.g. PyInstaller),
-    ``__file__`` may resolve to a temporary extraction directory so we
-    also try the current working directory and the directory that holds
-    the running executable.
-    """
+
+MODEL_CANDIDATES = {
+    "sensevoice": [
+        "SenseVoiceSmall",
+        "SenseVoiceSmall-onnx",
+        "iic/SenseVoiceSmall",
+    ],
+    "faster-whisper": [
+        "faster-whisper-large-v3",
+        "faster-whisper-large-v2",
+        "large-v3",
+        "large-v2",
+    ],
+    "funasr-vad": [
+        "speech_fsmn_vad_zh-cn-16k-common-pytorch",
+        "speech_fsmn_vad_zh-cn-16k-common",
+        "fsmn-vad",
+    ],
+}
+
+_MODEL_FILES = ("model.bin", "model.safetensors")
+
+
+def _base_dirs() -> List[str]:
     seen: set = set()
     bases: List[str] = []
     for raw in (
@@ -49,19 +90,38 @@ def _base_dirs() -> List[str]:
     return bases
 
 
-def _candidate_model_dirs(requested_model_size: str) -> List[str]:
-    requested = (requested_model_size or "").strip()
-    candidates = []
-    if requested:
-        candidates.append(requested)
-    for fallback in ["faster-whisper-large-v3", "faster-whisper-large-v2", "large-v3", "large-v2"]:
-        if fallback not in candidates:
-            candidates.append(fallback)
+def _normalize_backend() -> str:
+    if backend_name:
+        if "sensevoice" in backend_name:
+            return "sensevoice"
+        if "paraformer" in backend_name or "funasr" in backend_name:
+            return "funasr"
+        if "whisper" in backend_name:
+            return "faster-whisper"
+        return backend_name
 
+    lowered = str(model_size or "").strip().lower()
+    if "sensevoice" in lowered:
+        return "sensevoice"
+    if "paraformer" in lowered:
+        return "funasr"
+    return "faster-whisper"
+
+
+CURRENT_BACKEND = _normalize_backend()
+
+
+def _is_valid_model_dir(path: str) -> bool:
+    return any(os.path.isfile(os.path.join(path, f)) for f in _MODEL_FILES)
+
+
+def _candidate_model_dirs(names: List[str]) -> List[str]:
     dirs: List[str] = []
     seen: set = set()
     for base in _base_dirs():
-        for name in candidates:
+        for name in names:
+            if not name or "/" in name:
+                continue
             p = os.path.abspath(os.path.join(base, "app", "models", name))
             if p not in seen:
                 seen.add(p)
@@ -69,39 +129,68 @@ def _candidate_model_dirs(requested_model_size: str) -> List[str]:
     return dirs
 
 
-_MODEL_FILES = ("model.bin", "model.safetensors")
-
-
-def _is_valid_model_dir(path: str) -> bool:
-    """Check if directory contains a CTranslate2 model file (model.bin or model.safetensors)."""
-    return any(os.path.isfile(os.path.join(path, f)) for f in _MODEL_FILES)
-
-
-def _resolve_model_path() -> Tuple[Optional[str], List[str]]:
-    searched = _candidate_model_dirs(config.whisper.get("model_size", model_size))
+def _resolve_local_model_path(names: List[str], *, require_ctranslate2: bool = False) -> Tuple[Optional[str], List[str]]:
+    searched = _candidate_model_dirs(names)
     for path in searched:
         if os.path.isdir(path):
-            if _is_valid_model_dir(path):
+            if not require_ctranslate2 or _is_valid_model_dir(path):
                 return path, searched
-            else:
-                try:
-                    contents = os.listdir(path)
-                except OSError:
-                    contents = []
-                logger.warning(
-                    f"模型目录存在但未找到模型文件 ({', '.join(_MODEL_FILES)}): {path}\n"
-                    f"目录内容: {contents}"
-                )
+            try:
+                contents = os.listdir(path)
+            except OSError:
+                contents = []
+            logger.warning(
+                f"模型目录存在但未找到模型文件 ({', '.join(_MODEL_FILES)}): {path}\n目录内容: {contents}"
+            )
     return None, searched
 
 
-def _load_model() -> bool:
+def _resolve_faster_whisper_model_path() -> Tuple[Optional[str], List[str]]:
+    requested = (str(model_size or "").strip() or MODEL_CANDIDATES["faster-whisper"][0])
+    candidates = [requested]
+    for fallback in MODEL_CANDIDATES["faster-whisper"]:
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return _resolve_local_model_path(candidates, require_ctranslate2=True)
+
+
+def _resolve_sensevoice_model_ref() -> Tuple[str, List[str]]:
+    requested = str(model_size or "").strip()
+    candidates = []
+    if requested:
+        candidates.append(requested)
+    candidates.extend(MODEL_CANDIDATES["sensevoice"])
+    local_path, searched = _resolve_local_model_path(candidates, require_ctranslate2=False)
+    if local_path:
+        return local_path, searched
+    if requested and os.path.isdir(requested):
+        return requested, searched
+    if requested and "/" in requested:
+        return requested, searched
+    return "iic/SenseVoiceSmall", searched
+
+
+def _resolve_funasr_vad_model_ref() -> Tuple[str, List[str]]:
+    requested = DEFAULT_FUNASR_VAD_MODEL
+    candidates = []
+    if requested:
+        candidates.append(requested)
+    candidates.extend(MODEL_CANDIDATES["funasr-vad"])
+    local_path, searched = _resolve_local_model_path(candidates, require_ctranslate2=False)
+    if local_path:
+        return local_path, searched
+    if requested:
+        return requested, searched
+    return "fsmn-vad", searched
+
+
+def _load_faster_whisper_model() -> bool:
     global model, device, compute_type, _model_identity
     if WhisperModel is None:
         logger.error("未安装 faster-whisper，请先安装依赖后再使用自动字幕生成")
         return False
 
-    model_path, searched = _resolve_model_path()
+    model_path, searched = _resolve_faster_whisper_model_path()
     if not model_path:
         searched_text = "\n".join([f"- {p}" for p in searched])
         bases_text = "\n".join([f"- {d}" for d in _base_dirs()])
@@ -124,7 +213,8 @@ def _load_model() -> bool:
         )
         return False
 
-    if model is not None and _model_identity == model_path:
+    identity = f"faster-whisper::{model_path}"
+    if model is not None and _model_identity == identity:
         return True
 
     use_cuda = False
@@ -139,7 +229,7 @@ def _load_model() -> bool:
 
         use_cuda = check_cuda_available()
         if use_cuda:
-            logger.info(f"尝试使用 CUDA 加载模型: {model_path}")
+            logger.info(f"尝试使用 CUDA 加载 faster-whisper 模型: {model_path}")
             try:
                 model = WhisperModel(
                     model_size_or_path=model_path,
@@ -149,11 +239,11 @@ def _load_model() -> bool:
                 )
                 device = "cuda"
                 compute_type = "float16"
-                _model_identity = model_path
-                logger.info("成功使用 CUDA 加载模型")
+                _model_identity = identity
+                logger.info("成功使用 CUDA 加载 faster-whisper 模型")
                 return True
             except Exception as e:
-                logger.warning(f"CUDA 加载失败，回退到 CPU: {e}")
+                logger.warning(f"CUDA 加载 faster-whisper 失败，回退到 CPU: {e}")
                 use_cuda = False
     except Exception as e:
         logger.warning(f"CUDA检查过程出错，默认使用CPU: {e}")
@@ -161,79 +251,318 @@ def _load_model() -> bool:
 
     device = "cpu"
     compute_type = "int8"
-    logger.info(f"使用 CPU 加载模型: {model_path}")
+    logger.info(f"使用 CPU 加载 faster-whisper 模型: {model_path}")
     model = WhisperModel(
         model_size_or_path=model_path,
         device=device,
         compute_type=compute_type,
         local_files_only=True,
     )
-    _model_identity = model_path
+    _model_identity = identity
     logger.info(f"模型加载完成，使用设备: {device}, 计算类型: {compute_type}")
     return True
 
 
-def create(audio_file, subtitle_file: str = ""):
-    global model
-    if not _load_model():
+def _sensevoice_device() -> str:
+    prefer = str(config.whisper.get("device", device)).strip().lower() or "cpu"
+    if prefer in {"cuda", "gpu"}:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+    return "cpu"
+
+
+def _load_sensevoice_model() -> bool:
+    global model, _model_identity
+    if FunASRAutoModel is None:
+        logger.error("未安装 funasr，请先安装 funasr 和 modelscope 后再使用 SenseVoice-Small")
+        return False
+
+    model_ref, searched = _resolve_sensevoice_model_ref()
+    vad_ref, vad_searched = _resolve_funasr_vad_model_ref()
+    identity = f"sensevoice::{model_ref}::{vad_ref}"
+    if model is not None and _model_identity == identity:
+        return True
+
+    logger.info(
+        f"加载 SenseVoice-Small: model={model_ref}, vad_model={vad_ref}, device={_sensevoice_device()}"
+    )
+    try:
+        model = FunASRAutoModel(
+            model=model_ref,
+            vad_model=vad_ref,
+            vad_kwargs={"max_single_segment_time": DEFAULT_FUNASR_VAD_SEGMENT_MS},
+            device=_sensevoice_device(),
+            disable_progress_bar=True,
+        )
+        _model_identity = identity
+        return True
+    except Exception as e:
+        logger.error(
+            "加载 SenseVoice-Small 失败。\n"
+            f"model={model_ref}\n"
+            f"vad_model={vad_ref}\n"
+            f"searched_models={searched}\n"
+            f"searched_vad={vad_searched}\n"
+            f"error={e}"
+        )
+        return False
+
+
+def _load_model() -> bool:
+    backend = CURRENT_BACKEND
+    if backend == "sensevoice":
+        return _load_sensevoice_model()
+    if backend == "funasr":
+        return _load_sensevoice_model()
+    return _load_faster_whisper_model()
+
+
+def _normalize_language_code(lang: Optional[str]) -> Optional[str]:
+    if not lang:
+        return None
+    lang = str(lang).strip().lower()
+    mapping = {
+        "zh-cn": "zh",
+        "zh_simplified": "zh",
+        "zh-hans": "zh",
+        "cn": "zh",
+        "chs": "zh",
+        "zn": "zh",
+    }
+    return mapping.get(lang, lang)
+
+
+def _safe_file_size_mb(path: str) -> float:
+    try:
+        return os.path.getsize(path) / (1024 * 1024)
+    except Exception:
+        return 0.0
+
+
+def _ffmpeg_available() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return True
+    except Exception:
+        return False
+
+
+def _extract_audio_ffmpeg(video_file: str, audio_file: str) -> bool:
+    os.makedirs(os.path.dirname(audio_file), exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_file,
+        "-vn",
+        "-map", "a:0",
+        "-ac", str(DEFAULT_AUDIO_CHANNELS),
+        "-ar", str(DEFAULT_AUDIO_SAMPLE_RATE),
+        "-af", DEFAULT_AUDIO_FILTER,
+        "-c:a", "libmp3lame",
+        "-b:a", DEFAULT_AUDIO_BITRATE,
+        audio_file,
+    ]
+    logger.info(
+        f"使用 ffmpeg 提取人声音频: sample_rate={DEFAULT_AUDIO_SAMPLE_RATE}, "
+        f"channels={DEFAULT_AUDIO_CHANNELS}, bitrate={DEFAULT_AUDIO_BITRATE}, filter={DEFAULT_AUDIO_FILTER}"
+    )
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.returncode == 0 and os.path.exists(audio_file):
+        logger.info(f"ffmpeg 音频提取完成: {audio_file} ({_safe_file_size_mb(audio_file):.2f} MB)")
+        return True
+    logger.warning(f"ffmpeg 提取音频失败，准备回退 moviepy: {proc.stderr[-1200:] if proc.stderr else 'unknown error'}")
+    return False
+
+
+def _append_subtitle_line(subtitles: List[Dict[str, Any]], seg_text: str, seg_start: float, seg_end: float):
+    seg_text = (seg_text or "").strip()
+    if not seg_text:
+        return
+    seg_start = max(0.0, float(seg_start or 0.0))
+    seg_end = max(seg_start, float(seg_end or seg_start))
+    subtitles.append({"msg": seg_text, "start_time": seg_start, "end_time": seg_end})
+
+
+def _coerce_seconds(value: Any) -> float:
+    try:
+        num = float(value)
+    except Exception:
+        return 0.0
+    # sentence_info in FunASR usually uses milliseconds.
+    return num / 1000.0 if num > 1000 else num
+
+
+def _split_sentences_keep_punctuation(text: str) -> List[str]:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return []
+    parts = [seg.strip() for seg in re.split(r"(?<=[。！？!?；;])\s*", text) if seg.strip()]
+    if len(parts) <= 1:
+        parts = [seg.strip() for seg in re.split(r"(?<=[，,])\s*", text) if seg.strip()]
+    if len(parts) <= 1:
+        parts = utils.split_string_by_punctuations(text)
+    return [seg.strip() for seg in parts if seg.strip()] or ([text] if text else [])
+
+
+def _append_split_subtitle_lines(subtitles: List[Dict[str, Any]], text: str, start: float, end: float) -> int:
+    text = (text or "").strip()
+    if not text:
+        return 0
+    start = max(0.0, float(start or 0.0))
+    end = max(start, float(end or start))
+    sentences = _split_sentences_keep_punctuation(text)
+    if len(sentences) <= 1:
+        _append_subtitle_line(subtitles, text, start, end)
+        return 1
+
+    total_chars = sum(max(1, len(s)) for s in sentences)
+    duration = max(0.0, end - start)
+    if duration <= 0:
+        duration = max(1.5, 2.6 * len(sentences))
+        end = start + duration
+
+    cursor = start
+    appended = 0
+    for idx, sentence in enumerate(sentences):
+        weight = max(1, len(sentence)) / total_chars
+        if idx == len(sentences) - 1:
+            seg_end = end
+        else:
+            seg_end = min(end, cursor + duration * weight)
+        _append_subtitle_line(subtitles, sentence, cursor, seg_end)
+        cursor = seg_end
+        appended += 1
+    return appended
+
+
+def _extract_item_time_range(item: Dict[str, Any]) -> Tuple[float, float]:
+    sentence_info = item.get("sentence_info") or []
+    if sentence_info:
+        try:
+            start = _coerce_seconds(sentence_info[0].get("start", 0.0))
+            end = _coerce_seconds(sentence_info[-1].get("end", start))
+            return start, max(start, end)
+        except Exception:
+            pass
+    timestamp_pairs = item.get("timestamp") or []
+    if timestamp_pairs:
+        try:
+            return _coerce_seconds(timestamp_pairs[0][0]), max(_coerce_seconds(timestamp_pairs[0][0]), _coerce_seconds(timestamp_pairs[-1][1]))
+        except Exception:
+            pass
+    start = _coerce_seconds(item.get("start", 0.0))
+    end = _coerce_seconds(item.get("end", start))
+    return start, max(start, end)
+
+
+def _parse_funasr_result_item(item: Dict[str, Any], subtitles: List[Dict[str, Any]]) -> int:
+    count = 0
+    sentence_info = item.get("sentence_info") or []
+    for sentence in sentence_info:
+        if not isinstance(sentence, dict):
+            continue
+        text = sentence.get("text") or sentence.get("sentence") or ""
+        start = _coerce_seconds(sentence.get("start", 0.0))
+        end = _coerce_seconds(sentence.get("end", start))
+        _append_subtitle_line(subtitles, text, start, end)
+        count += 1
+    if count:
+        return count
+
+    timestamp_pairs = item.get("timestamp") or []
+    text = (item.get("text") or "").strip()
+    if timestamp_pairs and text:
+        try:
+            start = _coerce_seconds(timestamp_pairs[0][0])
+            end = _coerce_seconds(timestamp_pairs[-1][1])
+            return _append_split_subtitle_lines(subtitles, text, start, end)
+        except Exception:
+            pass
+
+    if text:
+        start, end = _extract_item_time_range(item)
+        return _append_split_subtitle_lines(subtitles, text, start, end)
+    return 0
+
+
+def _merge_overlapping_subtitles(subtitles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not subtitles:
+        return []
+    ordered = sorted(subtitles, key=lambda x: (float(x.get("start_time", 0.0) or 0.0), float(x.get("end_time", 0.0) or 0.0)))
+    merged: List[Dict[str, Any]] = []
+    for item in ordered:
+        text = (item.get("msg") or "").strip()
+        if not text:
+            continue
+        start = max(0.0, float(item.get("start_time", 0.0) or 0.0))
+        end = max(start, float(item.get("end_time", start) or start))
+        if merged and text == merged[-1].get("msg") and abs(start - float(merged[-1].get("start_time", 0.0))) < 0.01:
+            merged[-1]["end_time"] = max(float(merged[-1].get("end_time", start)), end)
+            continue
+        merged.append({"msg": text, "start_time": start, "end_time": end})
+    return merged
+
+
+def _create_with_sensevoice(audio_file: str, subtitle_file: str = ""):
+    if not _load_sensevoice_model():
         return None
 
     logger.info(f"start, output file: {subtitle_file}")
     if not subtitle_file:
         subtitle_file = f"{audio_file}.srt"
 
-    segments, info = model.transcribe(
-        audio_file,
-        beam_size=5,
-        word_timestamps=True,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-        initial_prompt="以下是普通话的句子",
+    forced_language = _normalize_language_code(DEFAULT_FORCE_LANGUAGE) or "zh"
+    logger.info(
+        "开始 SenseVoice-Small 转写: "
+        f"audio={audio_file}, size={_safe_file_size_mb(audio_file):.2f} MB, "
+        f"language={forced_language}, batch_size_s={DEFAULT_FUNASR_BATCH_SIZE_S}, "
+        f"merge_vad=True, merge_length_s={DEFAULT_FUNASR_MERGE_LENGTH_S}, use_itn={DEFAULT_FUNASR_USE_ITN}"
     )
 
-    logger.info(f"检测到的语言: '{info.language}', probability: {info.language_probability:.2f}")
-
     start = timer()
-    subtitles = []
+    try:
+        results = model.generate(
+            input=audio_file,
+            cache={},
+            language=forced_language,
+            use_itn=DEFAULT_FUNASR_USE_ITN,
+            batch_size_s=DEFAULT_FUNASR_BATCH_SIZE_S,
+            merge_vad=True,
+            merge_length_s=DEFAULT_FUNASR_MERGE_LENGTH_S,
+            output_timestamp=True,
+        )
+    except TypeError:
+        results = model.generate(
+            input=audio_file,
+            cache={},
+            language=forced_language,
+            use_itn=DEFAULT_FUNASR_USE_ITN,
+            batch_size_s=DEFAULT_FUNASR_BATCH_SIZE_S,
+            merge_vad=True,
+            merge_length_s=DEFAULT_FUNASR_MERGE_LENGTH_S,
+        )
+    subtitles: List[Dict[str, Any]] = []
+    raw_items = 0
+    if isinstance(results, dict):
+        results = [results]
+    for item in results or []:
+        if not isinstance(item, dict):
+            continue
+        raw_items += 1
+        _parse_funasr_result_item(item, subtitles)
 
-    def recognized(seg_text, seg_start, seg_end):
-        seg_text = seg_text.strip()
-        if not seg_text:
-            return
-        subtitles.append({"msg": seg_text, "start_time": seg_start, "end_time": seg_end})
-
-    for segment in segments:
-        words_idx = 0
-        words_len = len(segment.words)
-        seg_start = 0
-        seg_end = 0
-        seg_text = ""
-
-        if segment.words:
-            is_segmented = False
-            for word in segment.words:
-                if not is_segmented:
-                    seg_start = word.start
-                    is_segmented = True
-                seg_end = word.end
-                seg_text += word.word
-                if utils.str_contains_punctuation(word.word):
-                    seg_text = seg_text[:-1]
-                    if seg_text:
-                        recognized(seg_text, seg_start, seg_end)
-                    is_segmented = False
-                    seg_text = ""
-                if words_idx == 0 and segment.start < word.start:
-                    seg_start = word.start
-                if words_idx == (words_len - 1) and segment.end > word.end:
-                    seg_end = word.end
-                words_idx += 1
-
-        if seg_text:
-            recognized(seg_text, seg_start, seg_end)
+    subtitles = _merge_overlapping_subtitles(subtitles)
 
     end = timer()
-    logger.info(f"complete, elapsed: {end - start:.2f} s")
+    logger.info(
+        f"SenseVoice-Small complete, elapsed: {end - start:.2f} s, raw_items={raw_items}, subtitle_lines={len(subtitles)}"
+    )
+    if not subtitles:
+        logger.error("SenseVoice-Small 未生成有效字幕行")
+        return None
 
     idx = 1
     lines = []
@@ -248,6 +577,80 @@ def create(audio_file, subtitle_file: str = ""):
         f.write(sub)
     logger.info(f"subtitle file created: {subtitle_file}")
     return subtitle_file if os.path.exists(subtitle_file) else None
+
+
+def _create_with_faster_whisper(audio_file: str, subtitle_file: str = ""):
+    global model
+    if not _load_faster_whisper_model():
+        return None
+
+    logger.info(f"start, output file: {subtitle_file}")
+    if not subtitle_file:
+        subtitle_file = f"{audio_file}.srt"
+
+    forced_language = _normalize_language_code(DEFAULT_FORCE_LANGUAGE)
+    transcribe_kwargs = dict(
+        audio=audio_file,
+        beam_size=max(1, DEFAULT_BEAM_SIZE),
+        best_of=max(1, DEFAULT_BEST_OF),
+        word_timestamps=False,
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=DEFAULT_VAD_MIN_SILENCE_MS),
+        condition_on_previous_text=True,
+        temperature=0.0,
+        initial_prompt=DEFAULT_INITIAL_PROMPT,
+    )
+    if forced_language:
+        transcribe_kwargs["language"] = forced_language
+
+    logger.info(
+        "开始 faster-whisper 转写: "
+        f"audio={audio_file}, size={_safe_file_size_mb(audio_file):.2f} MB, "
+        f"language={forced_language or 'auto'}, beam_size={transcribe_kwargs['beam_size']}, "
+        f"best_of={transcribe_kwargs['best_of']}, word_timestamps={transcribe_kwargs['word_timestamps']}, "
+        f"vad_min_silence={DEFAULT_VAD_MIN_SILENCE_MS}ms"
+    )
+
+    segments, info = model.transcribe(**transcribe_kwargs)
+
+    logger.info(f"检测到的语言: '{info.language}', probability: {info.language_probability:.2f}")
+
+    start = timer()
+    subtitles = []
+    segment_count = 0
+    for segment in segments:
+        segment_count += 1
+        text = (getattr(segment, "text", "") or "").strip()
+        if not text:
+            continue
+        _append_subtitle_line(subtitles, text, float(getattr(segment, "start", 0.0) or 0.0), float(getattr(segment, "end", 0.0) or 0.0))
+
+    end = timer()
+    logger.info(f"complete, elapsed: {end - start:.2f} s, raw_segments={segment_count}, subtitle_lines={len(subtitles)}")
+
+    idx = 1
+    lines = []
+    for subtitle in subtitles:
+        text = subtitle.get("msg")
+        if text:
+            lines.append(utils.text_to_srt(idx, text, subtitle.get("start_time"), subtitle.get("end_time")))
+            idx += 1
+
+    sub = "\n".join(lines) + "\n"
+    with open(subtitle_file, "w", encoding="utf-8") as f:
+        f.write(sub)
+    logger.info(f"subtitle file created: {subtitle_file}")
+    return subtitle_file if os.path.exists(subtitle_file) else None
+
+
+def create(audio_file, subtitle_file: str = ""):
+    backend = CURRENT_BACKEND
+    if backend in {"sensevoice", "funasr"}:
+        result = _create_with_sensevoice(audio_file, subtitle_file)
+        if result:
+            return result
+        logger.warning("SenseVoice-Small 字幕生成失败，回退到 faster-whisper")
+    return _create_with_faster_whisper(audio_file, subtitle_file)
 
 
 def file_to_subtitles(filename):
@@ -328,7 +731,7 @@ def extract_audio_and_create_subtitle(video_file: str, subtitle_file: str = "") 
         video_name = os.path.splitext(os.path.basename(video_file))[0]
         audio_dir = utils.temp_dir("audio_extract")
         os.makedirs(audio_dir, exist_ok=True)
-        audio_file = os.path.join(audio_dir, f"{video_name}_audio.wav")
+        audio_file = os.path.join(audio_dir, f"{video_name}_speech.mp3")
 
         if not subtitle_file:
             subtitle_dir = utils.temp_dir("subtitles")
@@ -336,15 +739,29 @@ def extract_audio_and_create_subtitle(video_file: str, subtitle_file: str = "") 
             subtitle_file = os.path.join(subtitle_dir, f"{video_name}.srt")
 
         logger.info(f"开始从视频提取音频: {video_file}")
-        video = VideoFileClip(video_file)
-        if video.audio is None:
-            logger.error("视频文件不包含音频轨道，无法自动生成字幕")
-            return None
 
-        logger.info(f"正在提取音频到: {audio_file}")
-        video.audio.write_audiofile(audio_file, codec="pcm_s16le", logger=None)
+        extracted = False
+        if _ffmpeg_available():
+            extracted = _extract_audio_ffmpeg(video_file, audio_file)
+
+        if not extracted:
+            logger.info("回退到 moviepy 提取音频")
+            video = VideoFileClip(video_file)
+            if video.audio is None:
+                logger.error("视频文件不包含音频轨道，无法自动生成字幕")
+                return None
+
+            audio_file = os.path.join(audio_dir, f"{video_name}_speech.wav")
+            logger.info(f"正在提取音频到: {audio_file}")
+            video.audio.write_audiofile(
+                audio_file,
+                codec="pcm_s16le",
+                ffmpeg_params=["-ac", str(DEFAULT_AUDIO_CHANNELS), "-ar", str(DEFAULT_AUDIO_SAMPLE_RATE)],
+                logger=None,
+            )
+            logger.info(f"moviepy 音频提取完成: {audio_file} ({_safe_file_size_mb(audio_file):.2f} MB)")
+
         logger.info("音频提取完成，开始生成字幕")
-
         result = create(audio_file, subtitle_file)
         if result and os.path.exists(result):
             logger.info(f"字幕生成完成: {result}")

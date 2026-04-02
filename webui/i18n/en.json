@@ -12,7 +12,7 @@
     "Video Script": "Video Script (:blue[①Optional, use AI to generate ②Proper punctuation helps in generating subtitles])",
     "Save Script": "Save Script",
     "Crop Video": "Crop Video",
-    "Video File": "Video File (:blue[1️⃣Supports uploading video files (limit 2G) 2️⃣For large files, it is recommended to directly import them into the ./resource/videos directory])",
+    "Video File": "Video File (:blue[1、Supports uploading video files (limit 2G) 2、For large files, it is recommended to directly import them into the ./resource/videos directory])",
     "Plot Description": "Plot Description (:blue[Can be obtained from https://www.tvmao.com/])",
     "Generate Video Keywords": "Click to use AI to generate **Video Keywords** based on the **script**",
     "Please Enter the Video Subject": "Please enter the video script first",
@@ -86,6 +86,18 @@
     "Hide Log": "Hide Log",
     "Upload Local Files": "Upload Local Files",
     "File Uploaded Successfully": "File Uploaded Successfully",
-    "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)"
+    "Frame Interval (seconds)": "Frame Interval (seconds) (More keyframes consume more tokens)",
+    "Existing Subtitle Files":"Existing Subtitle Files",
+    "Existing Video Files":"Existing Video Files",
+    "Subtitle Source":"Subtitle Source",
+    "Upload Subtitle File":"Upload Subtitle File",
+    "Select subtitle file":"Select subtitle file",
+    "Upload New Subtitle":"Upload New Subtitle",
+    "Select Existing Subtitle":"Select Existing Subtitle",
+    "Auto Generate Subtitle":"Auto Generate Subtitle",
+    "Upload Video File":"Upload Video File",
+    "Upload":"Upload",
+    "Select Existing Video":"Select Existing Video",
+    "Upload New Video":"Upload New Video"
   }
 }

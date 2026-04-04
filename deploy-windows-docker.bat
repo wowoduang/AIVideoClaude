@@ -18,7 +18,7 @@ set "CYAN=[96m"
 set "NC=[0m"
 
 :: -------------------- 全局变量 --------------------
-set "APP_PORT=8501"
+set "APP_PORT=8366"
 set "SCRIPT_DIR=%~dp0"
 :: 去掉末尾的反斜杠
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"

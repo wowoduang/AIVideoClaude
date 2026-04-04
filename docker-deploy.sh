@@ -106,7 +106,7 @@ wait_for_service() {
     local attempt=1
 
     while [ $attempt -le $max_attempts ]; do
-        if curl -f http://localhost:8501/_stcore/health &>/dev/null; then
+        if curl -f http://localhost:8366/_stcore/health &>/dev/null; then
             log_info "服务已就绪"
             return 0
         fi
@@ -123,7 +123,7 @@ wait_for_service() {
 show_deployment_info() {
     echo
     log_info "NarratoAI 部署完成！"
-    echo "访问地址: http://localhost:8501"
+    echo "访问地址: http://localhost:8366"
     echo
     echo "常用命令:"
     echo "  查看日志: docker-compose logs -f"

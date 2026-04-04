@@ -22,9 +22,18 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
 # 激活虚拟环境
 ENV PATH="/opt/venv/bin:$PATH"
 
-# 复制 requirements.txt 并使用镜像安装 Python 依赖
+# 复制 requirements.txt 并安装 Python 依赖
 COPY requirements.txt .
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+# 先装项目依赖，再显式安装 PyTorch CPU 版，确保 funasr 可导入
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir --default-timeout=120 \
+    -i https://pypi.org/simple \
+    -r requirements.txt && \
+    python -m pip install --no-cache-dir --default-timeout=120 \
+    --index-url https://download.pytorch.org/whl/cpu \
+    torch torchaudio && \
+    python -m pip check
 
 # 运行阶段
 FROM python:3.12-slim-bookworm
@@ -78,11 +87,11 @@ RUN mkdir -p storage/temp storage/tasks storage/json storage/narration_scripts s
 USER narratoai
 
 # 暴露端口
-EXPOSE 8501
+EXPOSE 8366
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8501/_stcore/health || exit 1
+    CMD curl -f http://localhost:8366/_stcore/health || exit 1
 
 # 设置入口点
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

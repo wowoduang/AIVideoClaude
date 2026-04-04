@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="${SCRIPT_DIR}/venv"
 PYTHON_CMD=""
 PIP_MIRROR="${PIP_MIRROR:-https://pypi.org/simple/}"
-APP_PORT="${APP_PORT:-8501}"
+APP_PORT="${APP_PORT:-8366}"
 APP_HOST="${APP_HOST:-0.0.0.0}"
 INSTALL_MODE="${1:-full}"   # full | run | stop | status
 
@@ -44,7 +44,7 @@ show_help() {
     echo "  status  查看状态: 查看应用运行状态"
     echo ""
     echo "环境变量:"
-    echo "  APP_PORT=8501      应用端口（默认8501）"
+    echo "  APP_PORT=8366      应用端口（默认8366）"
     echo "  APP_HOST=0.0.0.0   监听地址（默认0.0.0.0）"
     echo "  PIP_MIRROR=URL     pip镜像源（默认官方源）"
     echo ""

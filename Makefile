@@ -31,7 +31,7 @@ build: ## 构建 Docker 镜像
 up: ## 启动服务
 	@echo "$(GREEN)启动服务...$(RESET)"
 	docker-compose up -d
-	@echo "$(GREEN)访问地址: http://localhost:8501$(RESET)"
+	@echo "$(GREEN)访问地址: http://localhost:8366$(RESET)"
 
 down: ## 停止服务
 	@echo "$(YELLOW)停止服务...$(RESET)"

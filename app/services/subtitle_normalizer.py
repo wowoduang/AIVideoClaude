@@ -294,11 +294,44 @@ def _strip_oral_fillers(text: str) -> str:
     return cleaned
 
 
+def _strip_whisper_tags(text: str) -> str:
+    """
+    清除 Whisper/SenseVoice 输出的特殊标签，例如：
+      <|zh|><|ANGRY|><|BGM|><|withitn|><|EMO_UNKNOWN|>
+    这些标签对字幕文字无意义，必须在进入流水线前清除。
+    """
+    if not text:
+        return ""
+    text = re.sub(r"<\|[^|>]+\|>", "", text)
+    text = re.sub(r"<[^>]{0,20}>", "", text)
+    return text.strip()
+
+
+def _is_noise_only(text: str) -> bool:
+    """
+    判断文本是否只有噪音（无实质中文/英文内容）。
+    有效内容：至少2个汉字，或至少2个3字母以上的英文单词。
+    """
+    if not text:
+        return True
+    if len(re.findall(r"[\u4e00-\u9fff]", text)) >= 2:
+        return False
+    if len(re.findall(r"\b[a-zA-Z]{3,}\b", text)) >= 2:
+        return False
+    return True
+
+
 def _clean_text(text: str) -> str:
     if not text:
         return ""
+    # 1. 清除 Whisper 特殊标签
+    text = _strip_whisper_tags(text)
+    # 2. 清除 HTML 标签（如 <i> <b>）
+    text = re.sub(r"<[^>]+>", "", text)
+    # 3. 合并空白
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"^[，。！？、,.!?]+|[，。！？、,.!?]+$", "", text)
+    # 4. 清除首尾标点
+    text = re.sub(r"^[，。！？、,.!?\s]+|[，。！？、,.!?\s]+$", "", text)
     return text.strip()
 
 
@@ -349,7 +382,8 @@ def normalize_segments(
             text = _strip_oral_fillers(text)
             text = _clean_text(text)
 
-        if not text:
+        # 跳过：空文本 或 纯 Whisper 噪音标签段（无实质内容）
+        if not text or _is_noise_only(text):
             continue
 
         start = float(item.get("start", 0) or 0)
@@ -419,3 +453,306 @@ def dump_segments_to_srt(segments: List[Dict], output_file: str) -> Optional[str
             f.write(f"{seconds_to_srt_time(seg['start'])} --> {seconds_to_srt_time(seg['end'])}\n")
             f.write(f"{seg.get('text','').strip()}\n\n")
     return output_file
+
+
+# ─────────────────────────────────────────────────────────────
+# 字幕时间轴偏移校准
+# 处理 Whisper 转录字幕与视频画面存在系统性偏移的问题
+# ─────────────────────────────────────────────────────────────
+
+def detect_subtitle_offset(
+    segments: List[Dict],
+    reference_dialogues: List[str] = None,
+    max_offset_sec: float = 5.0,
+) -> float:
+    """
+    检测字幕时间轴的系统性偏移量（秒）。
+
+    方法：找到字幕中首个有实质对白的段落，
+    与参考对白（如果提供）做时间比对。
+    如果没有参考对白，返回 0.0（无法自动校准）。
+
+    Parameters
+    ----------
+    segments : 已清洗的字幕段列表
+    reference_dialogues : 已知对白的精确时间点列表，格式 [(time_sec, text), ...]
+    max_offset_sec : 最大允许偏移量，超过此值认为校准失败
+
+    Returns
+    -------
+    offset : 偏移秒数，正数表示字幕偏早，负数表示字幕偏晚
+    """
+    if not segments or not reference_dialogues:
+        return 0.0
+
+    # 找字幕中第一个有实质内容的段落
+    first_sub = None
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if len(text) >= 4:  # 至少4个字才算实质对白
+            first_sub = seg
+            break
+
+    if not first_sub:
+        return 0.0
+
+    sub_time = float(first_sub.get("start", 0))
+    sub_text = first_sub.get("text", "")
+
+    # 在参考对白里找最接近的匹配
+    best_offset = 0.0
+    best_match_score = 0
+
+    for ref_time, ref_text in reference_dialogues:
+        # 简单文字重叠率
+        sub_chars = set(sub_text)
+        ref_chars = set(ref_text)
+        if not sub_chars or not ref_chars:
+            continue
+        overlap = len(sub_chars & ref_chars) / max(len(sub_chars | ref_chars), 1)
+        if overlap > best_match_score:
+            best_match_score = overlap
+            best_offset = sub_time - ref_time
+
+    if abs(best_offset) > max_offset_sec:
+        logger.warning(f"检测到字幕偏移量 {best_offset:.2f}s 超过最大值 {max_offset_sec}s，跳过校准")
+        return 0.0
+
+    logger.info(f"检测到字幕偏移量: {best_offset:.2f}s（字幕{'偏早' if best_offset > 0 else '偏晚'}）")
+    return best_offset
+
+
+def apply_subtitle_offset(segments: List[Dict], offset_sec: float) -> List[Dict]:
+    """
+    对所有字幕段应用时间偏移校准。
+
+    Parameters
+    ----------
+    segments : 字幕段列表
+    offset_sec : detect_subtitle_offset() 返回的偏移量
+
+    Returns
+    -------
+    校准后的字幕段列表（新对象，不修改原始数据）
+    """
+    if not offset_sec or abs(offset_sec) < 0.01:
+        return segments
+
+    corrected = []
+    for seg in segments:
+        new_seg = dict(seg)
+        new_start = max(0.0, float(seg.get("start", 0)) - offset_sec)
+        new_end = max(new_start + 0.1, float(seg.get("end", 0)) - offset_sec)
+        new_seg["start"] = round(new_start, 3)
+        new_seg["end"] = round(new_end, 3)
+        corrected.append(new_seg)
+
+    logger.info(f"字幕偏移校准完成: 偏移 {offset_sec:+.2f}s，共 {len(corrected)} 段")
+    return corrected
+
+
+def auto_calibrate_segments(
+    segments: List[Dict],
+    reference_dialogues: List[str] = None,
+) -> List[Dict]:
+    """
+    一键自动校准：检测偏移 + 应用校准。
+    如果没有参考对白，直接返回原始数据。
+    """
+    offset = detect_subtitle_offset(segments, reference_dialogues)
+    if abs(offset) < 0.05:
+        return segments
+    return apply_subtitle_offset(segments, offset)
+
+
+# ─────────────────────────────────────────────────────────────
+# 字幕时间空洞处理与修复
+# 处理 Whisper 丢弃无声段导致的大段时间空洞
+# ─────────────────────────────────────────────────────────────
+
+def analyze_subtitle_gaps(segments: List[Dict], gap_threshold: float = 5.0) -> List[Dict]:
+    """
+    分析字幕时间轴中的空洞。
+
+    Returns
+    -------
+    gaps : List[Dict]
+        每个空洞的 start/end/duration/type 信息。
+        type: "silence"（无声）| "missing"（可能有对白但未识别）
+    """
+    gaps = []
+    if not segments:
+        return gaps
+
+    # 片头空洞（视频开始到第一条字幕）
+    if segments[0]["start"] > gap_threshold:
+        gaps.append({
+            "start": 0.0,
+            "end": segments[0]["start"],
+            "duration": segments[0]["start"],
+            "type": "head_silence",
+            "before_text": "",
+            "after_text": segments[0]["text"],
+        })
+
+    # 中间空洞
+    for i in range(1, len(segments)):
+        gap = segments[i]["start"] - segments[i - 1]["end"]
+        if gap > gap_threshold:
+            gaps.append({
+                "start": segments[i - 1]["end"],
+                "end": segments[i]["start"],
+                "duration": round(gap, 3),
+                # 超过30秒的空洞很可能是场景切换（无声段）
+                # 5-30秒的空洞可能是没识别到的对白
+                "type": "scene_break" if gap > 30 else "possible_missing",
+                "before_text": segments[i - 1]["text"],
+                "after_text": segments[i]["text"],
+            })
+
+    return gaps
+
+
+def insert_placeholder_segments(
+    segments: List[Dict],
+    gap_threshold: float = 10.0,
+    placeholder_text: str = "",
+) -> List[Dict]:
+    """
+    在大时间空洞中插入占位段，保持时间轴连续性。
+    这样 plot_chunker 可以感知到"这里有段时间是无声/未识别的"。
+
+    占位段的 text 为空，will be filtered by _is_noise_only，
+    但其 start/end 会保留，供场景检测和剧情分段使用。
+
+    Parameters
+    ----------
+    gap_threshold : 超过多少秒才插入占位段（默认10秒）
+    """
+    if not segments:
+        return segments
+
+    result = []
+    prev_end = 0.0
+
+    for seg in segments:
+        gap = seg["start"] - prev_end
+        if gap > gap_threshold:
+            # 插入一个"无声段"占位符
+            placeholder = {
+                "seg_id": f"gap_{prev_end:.0f}",
+                "start": round(prev_end, 3),
+                "end": round(seg["start"], 3),
+                "text": "",  # 空文本，标记为无内容段
+                "source": "gap_placeholder",
+                "is_gap": True,
+                "gap_duration": round(gap, 3),
+            }
+            result.append(placeholder)
+        result.append(seg)
+        prev_end = seg["end"]
+
+    return result
+
+
+def build_full_timeline(
+    segments: List[Dict],
+    video_duration: float = 0.0,
+    gap_threshold: float = 10.0,
+) -> List[Dict]:
+    """
+    构建完整的时间轴，包含字幕段和无声占位段。
+    这是 plot_chunker 理想的输入格式。
+
+    Parameters
+    ----------
+    segments : 已清洗的字幕段
+    video_duration : 视频总时长（秒），用于在末尾补全时间轴
+    gap_threshold : 超过多少秒的空洞才插入占位段
+    """
+    with_placeholders = insert_placeholder_segments(segments, gap_threshold)
+
+    # 补全末尾
+    if video_duration > 0 and with_placeholders:
+        last_end = with_placeholders[-1]["end"]
+        if video_duration - last_end > gap_threshold:
+            with_placeholders.append({
+                "seg_id": f"gap_{last_end:.0f}",
+                "start": round(last_end, 3),
+                "end": round(video_duration, 3),
+                "text": "",
+                "source": "gap_placeholder",
+                "is_gap": True,
+                "gap_duration": round(video_duration - last_end, 3),
+            })
+
+    return with_placeholders
+
+
+def repair_subtitle_timing(
+    segments: List[Dict],
+    min_gap_between: float = 0.05,
+) -> List[Dict]:
+    """
+    修复字幕时间轴的微小问题：
+    1. 相邻字幕时间重叠 → 截断前一条的结束时间
+    2. 相邻字幕间隔过小（< min_gap_between）→ 微调
+    3. 同一条字幕 end <= start → 强制设置最小时长
+
+    这是针对"字幕时间和文字对不上"的直接修复。
+    """
+    if not segments:
+        return segments
+
+    repaired = [dict(segments[0])]
+    for seg in segments[1:]:
+        prev = repaired[-1]
+        new_seg = dict(seg)
+
+        # 修复重叠
+        if new_seg["start"] < prev["end"]:
+            # 如果重叠时间很短（< 0.5s），截断上一条
+            if prev["end"] - new_seg["start"] < 0.5:
+                prev["end"] = new_seg["start"] - 0.02
+            # 如果重叠很严重，说明时间轴本身有问题，保持原样并记录
+            else:
+                logger.warning(
+                    f"字幕时间严重重叠: [{prev['start']:.2f}-{prev['end']:.2f}] "
+                    f"与 [{new_seg['start']:.2f}-{new_seg['end']:.2f}]"
+                )
+
+        # 修复 end <= start
+        if new_seg["end"] <= new_seg["start"]:
+            new_seg["end"] = new_seg["start"] + 1.0
+
+        # 修复间隔过小
+        if 0 < new_seg["start"] - prev["end"] < min_gap_between:
+            new_seg["start"] = prev["end"] + min_gap_between
+
+        repaired.append(new_seg)
+
+    return repaired
+
+
+def get_subtitle_stats(segments: List[Dict]) -> Dict:
+    """
+    返回字幕质量统计信息，用于 UI 展示。
+    """
+    if not segments:
+        return {"total": 0, "coverage": 0.0, "gaps": [], "avg_duration": 0.0}
+
+    total_text_duration = sum(s["end"] - s["start"] for s in segments if not s.get("is_gap"))
+    total_span = segments[-1]["end"] - segments[0]["start"]
+    gaps = analyze_subtitle_gaps([s for s in segments if not s.get("is_gap")])
+
+    return {
+        "total": len([s for s in segments if not s.get("is_gap")]),
+        "total_with_gaps": len(segments),
+        "coverage": round(total_text_duration / max(total_span, 1) * 100, 1),
+        "total_text_duration": round(total_text_duration, 1),
+        "total_span": round(total_span, 1),
+        "gaps": gaps,
+        "gap_count": len(gaps),
+        "largest_gap": round(max((g["duration"] for g in gaps), default=0), 1),
+        "avg_duration": round(total_text_duration / max(len(segments), 1), 1),
+    }

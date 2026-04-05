@@ -440,13 +440,33 @@ def render_short_generate_options(tr):
         value=st.session_state.get("short_mix_name", ""),
         key="short_mix_name",
     )
-    st.slider(
-        tr("Temperature"),
-        0.0,
-        2.0,
-        float(st.session_state.get("short_mix_temperature", 0.7)),
-        key="short_mix_temperature",
+
+    # ── 片型选择（影响场景检测参数）─────────────────────────
+    film_type_options = {
+        tr("自动识别"): "auto",
+        tr("对话剧情片"): "dialogue",
+        tr("动作片"): "action",
+        tr("纪录片"): "documentary",
+    }
+    current_film_type = st.session_state.get("film_type", "auto")
+    film_type_label = st.selectbox(
+        tr("片型（影响场景检测精度）"),
+        options=list(film_type_options.keys()),
+        index=list(film_type_options.values()).index(current_film_type)
+              if current_film_type in film_type_options.values() else 0,
+        key="film_type_select",
     )
+    st.session_state["film_type"] = film_type_options[film_type_label]
+
+    # ── 风格参考（可选，留空则用默认风格）──────────────────
+    st.text_area(
+        tr("解说风格参考（可选，留空用默认风格）"),
+        value=st.session_state.get("style_examples", ""),
+        height=80,
+        placeholder="例如：节奏明快，像朋友聊天，多用反转词...",
+        key="style_examples",
+    )
+
     st.number_input(
         tr("Custom Clip Count"),
         min_value=1,
@@ -456,6 +476,51 @@ def render_short_generate_options(tr):
     )
     if subtitle_info["subtitle_path"]:
         st.caption(f"{tr('Short mix subtitle ready')}: {os.path.basename(subtitle_info['subtitle_path'])}")
+
+    # ── 展示上次生成的剧情分段结果（如果有）──────────────
+    _render_plot_chunks_info(tr)
+
+
+def _render_plot_chunks_info(tr):
+    """展示上次生成的剧情分段信息（仅供参考，不可编辑）"""
+    plot_chunks = st.session_state.get("short_drama_plot_chunks", [])
+    global_bible = st.session_state.get("short_drama_global_bible", {})
+    if not plot_chunks:
+        return
+
+    with st.expander(f"📊 {tr('剧情分段结果')} ({len(plot_chunks)} 段)", expanded=False):
+        if global_bible:
+            summary = global_bible.get("story_summary", "")
+            if summary:
+                st.info(f"**剧情概要：** {summary}")
+            warnings = global_bible.get("narrative_warnings", [])
+            if warnings:
+                st.warning(f"⚠️ 发现 {len(warnings)} 个字幕可信度警告（角色可能说谎/回忆/旁白等）")
+
+        for chunk in plot_chunks[:20]:  # 最多展示20段
+            seg_id = chunk.get("segment_id", "")
+            start = chunk.get("start", 0)
+            end = chunk.get("end", 0)
+            text = chunk.get("subtitle_text", "") or chunk.get("aligned_subtitle_text", "")
+            importance = chunk.get("importance", 3)
+            plot_func = chunk.get("plot_function", "")
+            seg_type = chunk.get("segment_type", "narration")
+            confidence = chunk.get("boundary_confidence", 0)
+
+            # 重要性颜色
+            icon = "🔴" if importance >= 4 else ("🟡" if importance >= 3 else "⚪")
+            type_badge = {"narration": "📝", "original": "🎬", "skip": "⏭"}.get(seg_type, "📝")
+
+            col1, col2, col3 = st.columns([1, 2, 4])
+            with col1:
+                st.caption(f"{icon} {seg_id}")
+            with col2:
+                m1, s1 = divmod(int(start), 60)
+                m2, s2 = divmod(int(end), 60)
+                st.caption(f"{m1:02d}:{s1:02d}→{m2:02d}:{s2:02d}")
+            with col3:
+                label = f"{type_badge} {plot_func}" if plot_func else type_badge
+                st.caption(f"{label} | {text[:40]}{'...' if len(text)>40 else ''}")
 
 
 def render_short_drama_summary(tr):

@@ -20,7 +20,7 @@ services:
 
     # 健康检查
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8866/_stcore/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8366/_stcore/health"]
       interval: 30s
       timeout: 10s
       retries: 3

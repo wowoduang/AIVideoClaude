@@ -95,14 +95,29 @@ class PlotChunker:
     def build_chunks(self, subtitle_segments: List[Dict]) -> List[PlotChunk]:
         """
         主入口：把字幕段列表切成粗剧情块。
+        支持含无声占位段（is_gap=True）的输入。
         """
         if not subtitle_segments:
             return []
 
-        # 预处理：过滤空字幕
+        # 分离有效字幕和无声占位段
         segs = [s for s in subtitle_segments if (s.get("text") or "").strip()]
+        gap_segs = [s for s in subtitle_segments if s.get("is_gap")]
+
         if not segs:
-            return []
+            # 全是占位段，按时间段返回
+            chunks = []
+            for gs in gap_segs:
+                chunks.append(PlotChunk(
+                    segment_id="",
+                    start=gs["start"], end=gs["end"],
+                    subtitle_ids=[], subtitle_text="",
+                    boundary_source=["gap_placeholder"],
+                    boundary_confidence=0.9,
+                    boundary_reasons=["无声段"],
+                    has_dialogue=False, visual_only=True,
+                ))
+            return chunks
 
         total_dur = float(segs[-1].get("end", 0)) - float(segs[0].get("start", 0))
         logger.info("粗分段开始: {} 条字幕，总时长 {:.0f}s", len(segs), total_dur)
@@ -363,11 +378,47 @@ class PlotChunker:
 
 # ── 便捷入口 ──────────────────────────────────────────────────
 
-def build_plot_chunks_from_subtitles(subtitle_segments: List[Dict]) -> List[PlotChunk]:
-    """pipeline 调用的入口函数，与 plot_first_pipeline.py 接口兼容"""
+def build_plot_chunks_from_subtitles(
+    subtitle_segments: List[Dict],
+    video_duration: float = 0.0,
+    fill_gaps: bool = True,
+    gap_threshold: float = 10.0,
+) -> List[PlotChunk]:
+    """
+    pipeline 调用的入口函数，与 plot_first_pipeline.py 接口兼容。
+
+    Parameters
+    ----------
+    subtitle_segments : 已清洗的字幕段
+    video_duration : 视频总时长（秒），用于补全末尾无声段
+    fill_gaps : 是否在大时间空洞处插入无声占位段
+    gap_threshold : 超过多少秒才视为需要处理的空洞
+    """
+    from app.services.subtitle_normalizer import (
+        repair_subtitle_timing,
+        build_full_timeline,
+        analyze_subtitle_gaps,
+    )
+
+    # 1. 修复微小时间问题（重叠、end<=start）
+    segs = repair_subtitle_timing(subtitle_segments)
+
+    # 2. 分析并记录空洞信息（供日志和 UI 展示）
+    real_segs = [s for s in segs if not s.get("is_gap")]
+    gaps = analyze_subtitle_gaps(real_segs, gap_threshold=gap_threshold)
+    if gaps:
+        logger.info("字幕空洞分析: {} 个空洞，最大 {:.1f}s",
+                    len(gaps), max(g["duration"] for g in gaps))
+        for g in gaps:
+            logger.debug("  空洞 {:.1f}s-{:.1f}s ({:.1f}s) type={}",
+                        g["start"], g["end"], g["duration"], g["type"])
+
+    # 3. 构建完整时间轴（有声段 + 无声占位段）
+    if fill_gaps:
+        segs = build_full_timeline(segs, video_duration, gap_threshold)
+
     chunker = PlotChunker()
-    chunks = chunker.build_chunks(subtitle_segments)
-    # 转换为 pipeline 期望的 dict 格式（兼容 evidence_fuser 等下游）
+    chunks = chunker.build_chunks(segs)
     return [_chunk_to_dict(c) for c in chunks]
 
 

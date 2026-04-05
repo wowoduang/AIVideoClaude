@@ -210,10 +210,8 @@ class ScriptGenerator:
         progress_callback(90, "正在生成文案...")
         
         # 获取文本生��配置
-        text_provider = config.app.get('text_llm_provider', 'gemini').lower()
-        text_api_key = config.app.get(f'text_{text_provider}_api_key')
-        text_model = config.app.get(f'text_{text_provider}_model_name')
-        text_base_url = config.app.get(f'text_{text_provider}_base_url')
+        from app.services.llm_caller import get_llm_config_from_app_config
+        text_api_key, text_base_url, text_model = get_llm_config_from_app_config()
 
         # 根据提供商类型选择合适的处理器
         if text_provider == 'gemini(openai)':

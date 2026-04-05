@@ -84,10 +84,12 @@ def generate_script_short(tr, params, custom_clips=5):
             else:
                 logger.info("[短剧模式] 未提供字幕文件，将自动生成字幕")
 
-            text_provider = config.app.get("text_llm_provider", "gemini").lower()
-            text_api_key = config.app.get(f"text_{text_provider}_api_key")
-            text_model = config.app.get(f"text_{text_provider}_model_name")
-            text_base_url = config.app.get(f"text_{text_provider}_base_url")
+            from app.services.llm_caller import get_llm_config_from_app_config
+            text_api_key, text_base_url, text_model = get_llm_config_from_app_config()
+
+            # 读取 UI 面板中用户设置的新参数
+            film_type = st.session_state.get("film_type", "auto")
+            style_examples = str(st.session_state.get("style_examples", "") or "").strip()
 
             pipeline_result = run_plot_first_pipeline(
                 video_path=video_path,
@@ -97,6 +99,8 @@ def generate_script_short(tr, params, custom_clips=5):
                 text_model=text_model,
                 style="short_drama",
                 visual_mode="boost",
+                film_type=film_type,
+                style_examples=style_examples,
                 progress_callback=update_progress,
             )
             if not pipeline_result.get("success"):
@@ -120,9 +124,10 @@ def generate_script_short(tr, params, custom_clips=5):
             st.session_state["short_drama_subtitle_path"] = actual_subtitle_path
             st.session_state["short_drama_subtitle_source"] = subtitle_source
             st.session_state["short_drama_subtitle_segments"] = subtitle_segments
-            st.session_state["short_drama_plot_chunks"] = plot_chunks
+            st.session_state["short_drama_plot_chunks"] = pipeline_result.get("refined_segments") or plot_chunks
             st.session_state["short_drama_frame_records"] = frame_records
             st.session_state["short_drama_analysis_path"] = analysis_path
+            st.session_state["short_drama_global_bible"] = pipeline_result.get("global_bible") or {}
             st.session_state["video_clip_json"] = script_items
             st.session_state["video_clip_json_path"] = script_path
 
@@ -137,6 +142,35 @@ def generate_script_short(tr, params, custom_clips=5):
             logger.info(f"[短剧模式] 脚本内容: {json.dumps(script_items, ensure_ascii=False, indent=2)}")
 
             st.success(f"✅ 字幕准备完成，共 {len(subtitle_segments)} 段（{source_text}）")
+
+            # 字幕质量分析：空洞检测
+            if subtitle_segments:
+                try:
+                    from app.services.subtitle_normalizer import get_subtitle_stats, analyze_subtitle_gaps
+                    stats = get_subtitle_stats(subtitle_segments)
+                    gaps = analyze_subtitle_gaps(subtitle_segments, gap_threshold=10.0)
+                    if gaps:
+                        gap_msgs = []
+                        for g in gaps:
+                            m1, s1 = divmod(int(g["start"]), 60)
+                            m2, s2 = divmod(int(g["end"]), 60)
+                            gap_msgs.append(
+                                f"{m1:02d}:{s1:02d}~{m2:02d}:{s2:02d}"
+                                f"（{g['duration']:.0f}秒，{'场景切换' if g['type']=='scene_break' else '可能有未识别对白'}）"
+                            )
+                        st.warning(
+                            f"⚠️ 检测到 {len(gaps)} 个字幕空洞（无声或未识别段）：\n" +
+                            "\n".join(gap_msgs) +
+                            "\n\n提示：这些区域将作为无声段处理，不影响解说生成。"
+                            "如需提高识别率，建议重新用更低阈值的 Whisper 转录。"
+                        )
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("字幕有效段", stats["total"])
+                    col2.metric("时间覆盖率", f"{stats['coverage']}%")
+                    col3.metric("最大空洞", f"{stats['largest_gap']}s")
+                except Exception as e:
+                    logger.warning(f"字幕质量分析失败: {e}")
+
             st.info(
                 f"已生成 {len(plot_chunks)} 个剧情块、{len(frame_records)} 张代表帧、{len(script_items)} 段解说。"
             )

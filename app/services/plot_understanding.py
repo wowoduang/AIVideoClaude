@@ -46,37 +46,16 @@ def _get_prompt_via_manager(category: str, name: str, params: dict) -> Optional[
 
 def _call_llm(system: str, user: str, api_key: str, base_url: str, model: str,
               temperature: float = 0.3) -> str:
-    try:
-        import requests
-    except ImportError:
-        logger.error("requests 未安装")
-        return ""
-
-    if not api_key or not base_url or not model:
-        logger.warning("LLM 配置不完整，跳过调用")
-        return ""
-
-    url = base_url.rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url = url + "/chat/completions"
-
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "temperature": temperature,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=180)
-        resp.raise_for_status()
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        logger.error("LLM 调用失败: {}", e)
-        return ""
+    """
+    统一 LLM 调用入口。
+    优先使用 LiteLLM provider（已注册时），兜底使用直接 HTTP。
+    """
+    from app.services.llm_caller import call_llm_sync
+    return call_llm_sync(
+        system=system, user=user,
+        api_key=api_key, base_url=base_url, model=model,
+        temperature=temperature,
+    )
 
 
 def _parse_json_response(text: str) -> Optional[Dict]:

@@ -84,14 +84,14 @@ start_webui() {
   log "启动 NarratoAI WebUI..."
 
   if command -v netstat >/dev/null 2>&1; then
-    if netstat -tuln | grep -q ":8866 "; then
-      log "警告: 端口 8866 已被占用"
+    if netstat -tuln | grep -q ":8366 "; then
+      log "警告: 端口 8366 已被占用"
     fi
   fi
 
   exec streamlit run webui.py \
     --server.address=0.0.0.0 \
-    --server.port=8866 \
+    --server.port=8366 \
     --server.enableCORS=true \
     --server.maxUploadSize=2048 \
     --server.enableXsrfProtection=false \
@@ -114,7 +114,7 @@ case "$1" in
     ;;
   "health")
     log "执行健康检查..."
-    if curl -f http://localhost:8866/_stcore/health >/dev/null 2>&1; then
+    if curl -f http://localhost:8366/_stcore/health >/dev/null 2>&1; then
       log "健康检查通过"
       exit 0
     else

@@ -151,10 +151,8 @@ def generate_script_short_sunmmary(params, subtitle_path, video_theme, temperatu
                 st.error("字幕文件不存在")
                 return
 
-            text_provider = config.app.get("text_llm_provider", "gemini").lower()
-            text_api_key = config.app.get(f"text_{text_provider}_api_key", "")
-            text_model = config.app.get(f"text_{text_provider}_model_name", "")
-            text_base_url = config.app.get(f"text_{text_provider}_base_url", "")
+            from app.services.llm_caller import get_llm_config_from_app_config
+            text_api_key, text_base_url, text_model = get_llm_config_from_app_config()
 
             generation_mode = st.session_state.get("generation_mode", "balanced")
             visual_mode = st.session_state.get("visual_mode", "auto")

@@ -161,7 +161,19 @@ def _run(
 
     # ── D. 字幕语义粗分段 ────────────────────────────────────
     progress(36, "字幕语义分段...")
-    plot_chunks = build_plot_chunks_from_subtitles(subtitle_segments)
+    # 获取视频时长，传给分段器用于补全末尾无声段
+    video_duration = 0.0
+    try:
+        from app.services.media_duration import get_video_duration
+        video_duration = get_video_duration(video_path) or 0.0
+    except Exception:
+        pass
+    plot_chunks = build_plot_chunks_from_subtitles(
+        subtitle_segments,
+        video_duration=video_duration,
+        fill_gaps=True,
+        gap_threshold=10.0,
+    )
     if not plot_chunks:
         raise ValueError("剧情块构建失败，未生成任何 plot chunk")
     logger.info("D 粗分段完成: {} 个剧情块", len(plot_chunks))

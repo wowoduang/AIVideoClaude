@@ -99,10 +99,8 @@ def generate_script_docu(params):
             logger.info(f"分析结果已保存到: {analysis_json_path}")
 
             update_progress(88, "正在生成解说文案...")
-            text_provider = config.app.get('text_llm_provider', 'gemini').lower()
-            text_api_key = config.app.get(f'text_{text_provider}_api_key')
-            text_model = config.app.get(f'text_{text_provider}_model_name')
-            text_base_url = config.app.get(f'text_{text_provider}_base_url')
+            from app.services.llm_caller import get_llm_config_from_app_config
+            text_api_key, text_base_url, text_model = get_llm_config_from_app_config()
             narration_items = generate_narration_from_scene_evidence(
                 scene_evidence=scene_evidence,
                 api_key=text_api_key,

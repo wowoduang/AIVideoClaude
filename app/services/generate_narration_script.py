@@ -60,6 +60,20 @@ POLISH_PROMPT = """
 
 
 def _call_chat_completion(prompt: str, api_key: str, base_url: str, model: str) -> str:
+    """调用 LLM，统一使用 llm_caller（支持 LiteLLM 和直接 HTTP）"""
+    from app.services.llm_caller import call_llm_sync
+    return call_llm_sync(
+        system="你是一个严格、可靠的中文视频解说助手。",
+        user=prompt,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=0.3,
+    )
+
+
+def _call_chat_completion_unused(prompt: str, api_key: str, base_url: str, model: str) -> str:
+    """保留原始实现供参考，实际不调用"""
     if not requests or not api_key or not base_url or not model:
         return ""
     url = base_url.rstrip("/")

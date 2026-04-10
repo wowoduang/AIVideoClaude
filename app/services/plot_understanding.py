@@ -201,8 +201,25 @@ def run_all_segment_analysis(
     for i, seg in enumerate(segments):
         seg_id = seg.get("segment_id", "")
         if seg.get("segment_type") == "skip":
+            # skip段：低成本规则处理，不调LLM（对应共识"低成本初理解"）
             card = _fallback_segment_card(seg)
             card.segment_type = "skip"
+            card.plot_function = "节奏缓冲"
+            card.importance = 1
+            card.next_segment_handoff = ""
+            state.record_segment_card(card)
+            cards.append(card)
+            continue
+
+        # 无声纯画面段：规则处理，不调LLM
+        if seg.get("visual_only") and not (seg.get("subtitle_text") or "").strip():
+            card = _fallback_segment_card(seg)
+            card.segment_type = "original"
+            card.visual_dependency = 5
+            card.importance = max(1, int(seg.get("importance", 2)))
+            card.plot_function = "节奏缓冲"
+            card.what_happened = f"画面推进（无对白，{seg.get('duration', 0):.0f}秒）"
+            card.next_segment_handoff = "无声段，画面继续推进"
             state.record_segment_card(card)
             cards.append(card)
             continue
@@ -419,3 +436,163 @@ def _fmt(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ─────────────────────────────────────────────────────────────
+# 全局回修（第三轮后的一致性检查）
+# 对应会话共识第10步：全局回修
+# ─────────────────────────────────────────────────────────────
+
+def run_global_revision(
+    state: "PipelineState",
+    api_key: str = "",
+    base_url: str = "",
+    model: str = "",
+) -> list:
+    """
+    全局回修：对所有 segment_cards 做一致性检查，
+    解决前后段理解矛盾、切段过碎、叙事不连贯等问题。
+
+    对应文档第10步：全局回修
+    返回修订后的 script_items，可替换第三轮输出。
+    """
+    cards = state.get_all_cards()
+    if not cards:
+        return []
+
+    # 检测明显问题
+    issues = _detect_consistency_issues(cards)
+    if not issues:
+        logger.info("全局回修：未发现一致性问题，跳过")
+        return []
+
+    logger.info("全局回修：发现 {} 个一致性问题", len(issues))
+
+    # 构建回修 prompt
+    bible_str = state.global_bible.to_prompt_str() if state.global_bible else "{}"
+    cards_summary = _build_cards_summary(cards)
+    issues_str = "\n".join(f"- {iss}" for iss in issues)
+
+    system = "你是专业的影视解说审校编辑，负责检查解说脚本的叙事一致性并给出修订建议。"
+    user = f"""## 全局剧情底稿
+{bible_str}
+
+## 当前各段理解摘要
+{cards_summary}
+
+## 发现的一致性问题
+{issues_str}
+
+## 任务
+针对以上问题，输出修订建议。严格按 JSON 格式：
+
+{{
+  "revisions": [
+    {{
+      "segment_id": "seg_001",
+      "issue": "问题描述",
+      "revised_narration": "修订后的解说文案",
+      "revised_segment_type": "narration|original|skip"
+    }}
+  ],
+  "merge_suggestions": [
+    {{"merge_ids": ["seg_003", "seg_004"], "reason": "这两段叙事状态相同，建议合并"}}
+  ]
+}}
+
+只输出 JSON，不输出其他文字。"""
+
+    raw = _call_llm(system=system, user=user,
+                    api_key=api_key, base_url=base_url, model=model,
+                    temperature=0.2)
+    data = _parse_json_response(raw)
+    if not data:
+        logger.warning("全局回修解析失败，跳过")
+        return []
+
+    logger.info("全局回修完成：{} 条修订建议", len(data.get("revisions", [])))
+    return data.get("revisions", [])
+
+
+def _detect_consistency_issues(cards: list) -> list:
+    """规则检测：发现明显的一致性问题"""
+    issues = []
+    total = len(cards)
+
+    for i, card in enumerate(cards):
+        # 问题1：高歧义段未标 original 或 skip
+        if card.ambiguity >= 4 and card.segment_type == "narration":
+            issues.append(
+                f"{card.segment_id}: 歧义度={card.ambiguity}，但类型为 narration，"
+                f"建议改为 original 或加保守表达"
+            )
+
+        # 问题2：连续多个"节奏缓冲"段（超过3个连续）
+        if i >= 2:
+            prev2 = cards[i-2].plot_function
+            prev1 = cards[i-1].plot_function
+            curr = card.plot_function
+            if prev2 == prev1 == curr == "节奏缓冲":
+                issues.append(
+                    f"{card.segment_id}: 连续3段都是节奏缓冲，"
+                    f"建议合并或跳过中间段"
+                )
+
+        # 问题3：结局前没有高潮
+        if i == total - 1 and card.plot_function == "结局收束":
+            climax_count = sum(1 for c in cards if c.plot_function in ("情感爆发", "反转", "冲突升级"))
+            if climax_count == 0:
+                issues.append("全片没有情感爆发/反转段落，解说可能过于平淡")
+
+        # 问题4：重要段落解说文案太短
+        if card.importance >= 4 and card.segment_type == "narration":
+            if len(card.narration_candidate) < 20:
+                issues.append(
+                    f"{card.segment_id}: importance={card.importance} 但解说文案仅 "
+                    f"{len(card.narration_candidate)} 字，建议扩写"
+                )
+
+    return issues[:10]  # 最多返回10个问题
+
+
+def _build_cards_summary(cards: list) -> str:
+    lines = []
+    for c in cards:
+        lines.append(
+            f"[{c.segment_id}] {c.plot_function} | importance={c.importance} | "
+            f"ambiguity={c.ambiguity} | type={c.segment_type} | "
+            f"{(c.what_happened or '')[:40]}"
+        )
+    return "\n".join(lines)
+
+
+def apply_revisions_to_script(
+    script_items: list,
+    revisions: list,
+) -> list:
+    """
+    把全局回修的建议应用到最终 script_items。
+    """
+    if not revisions:
+        return script_items
+
+    revision_map = {r["segment_id"]: r for r in revisions if r.get("segment_id")}
+    updated = []
+    for item in script_items:
+        seg_id = item.get("segment_id", "")
+        if seg_id in revision_map:
+            rev = revision_map[seg_id]
+            new_item = dict(item)
+            if rev.get("revised_narration"):
+                new_item["narration"] = rev["revised_narration"]
+                logger.debug("回修 {}: {}", seg_id, rev.get("issue", ""))
+            if rev.get("revised_segment_type"):
+                new_item["OST"] = 1 if rev["revised_segment_type"] == "original" else (
+                    2 if rev["revised_segment_type"] == "skip" else 0
+                )
+            updated.append(new_item)
+        else:
+            updated.append(item)
+
+    logger.info("全局回修应用完成：修改了 {} 个片段", len(revision_map))
+    return updated

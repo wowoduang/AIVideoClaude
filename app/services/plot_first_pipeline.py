@@ -33,6 +33,8 @@ from app.services.plot_understanding import (
     build_global_understanding,
     run_all_segment_analysis,
     run_narration_integration,
+    run_global_revision,
+    apply_revisions_to_script,
 )
 from app.services.pipeline_state import PipelineState
 from app.services.preflight_check import PreflightError, validate_script_items
@@ -186,7 +188,9 @@ def _run(
 
     # ── F. 精分段 + 打分 ─────────────────────────────────────
     progress(50, "精分段打分...")
-    refined = refine_segments(fused)
+    # 把 narrative_warnings 传给精分段，提升对应位置的歧义评分
+    warnings_for_refiner = global_bible.narrative_warnings if global_bible else []
+    refined = refine_segments(fused, narrative_warnings=warnings_for_refiner)
     refined_dicts = [refined_to_dict(r) for r in refined]
     logger.info("F 精分段完成: {} 个段落", len(refined_dicts))
 
@@ -231,6 +235,22 @@ def _run(
     script_items = ensure_script_shape(script_items)
     if not script_items:
         raise ValueError("未生成有效脚本片段")
+
+    # ── I-2. 全局回修（对应会话共识第10步）────────────────
+    progress(86, "全局一致性回修...")
+    try:
+        revisions = run_global_revision(
+            state=state,
+            api_key=text_api_key,
+            base_url=text_base_url,
+            model=text_model,
+        )
+        if revisions:
+            script_items = apply_revisions_to_script(script_items, revisions)
+            script_items = ensure_script_shape(script_items)
+            logger.info("全局回修完成：{} 条修订", len(revisions))
+    except Exception as e:
+        logger.warning("全局回修失败，跳过: {}", e)
 
     # 兜底：补充 evidence 信息供旧版下游使用
     scene_evidence = fuse_scene_evidence(

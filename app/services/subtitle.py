@@ -488,6 +488,86 @@ def _parse_funasr_result_item(item: Dict[str, Any], subtitles: List[Dict[str, An
     return 0
 
 
+
+
+# ── SenseVoice 语气词 & faster-whisper 幻觉过滤 ────────────────
+_SENSEVOICE_NOISE_RE = re.compile(
+    r"^(?:嗯+|啊+|哦+|哼+|呃+|额+|噢+|哎+|唉+|哇+|哈+|嘿+|喂+|嗯嗯|啊啊|嗯哼|呵呵|哈哈|嘿嘿)$",
+    re.IGNORECASE
+)
+_HALLUCINATION_RE_LIST = [
+    re.compile(r"(.)\1{4,}"),
+    re.compile(r"(..+)\1{3,}"),
+    re.compile(r"^[，。！？、·…—\s]+$"),
+    re.compile(r"^(?:字幕|翻译|校对|制作|出品|版权).{0,10}$"),
+    re.compile(r"^(?:请订阅|点赞|关注|转发).{0,20}$"),
+]
+
+
+def _is_hallucination(text: str) -> bool:
+    text = (text or "").strip()
+    if not text:
+        return True
+    if _SENSEVOICE_NOISE_RE.match(text):
+        return True
+    for pat in _HALLUCINATION_RE_LIST:
+        if pat.search(text):
+            return True
+    return False
+
+
+def _append_words_as_subtitles(
+    subtitles: List[Dict[str, Any]],
+    words: list,
+    seg_start: float,
+    seg_end: float,
+    max_chars: int = 30,
+    max_duration: float = 6.0,
+) -> None:
+    if not words:
+        return
+    buf_text = ""
+    buf_start = seg_start
+    buf_end = seg_start
+    for word in words:
+        w_text = (getattr(word, "word", "") or "").strip()
+        w_start = float(getattr(word, "start", buf_end) or buf_end)
+        w_end = float(getattr(word, "end", w_start) or w_start)
+        if not w_text:
+            continue
+        should_split = buf_text and (len(buf_text) + len(w_text) > max_chars or w_end - buf_start > max_duration)
+        if should_split:
+            if not _is_hallucination(buf_text):
+                _append_subtitle_line(subtitles, buf_text, buf_start, buf_end)
+            buf_text = w_text
+            buf_start = w_start
+        else:
+            buf_text = (buf_text + w_text).strip()
+        buf_end = w_end
+    if buf_text and not _is_hallucination(buf_text):
+        _append_subtitle_line(subtitles, buf_text, buf_start, min(buf_end, seg_end))
+
+
+def _fix_sensevoice_drift(subtitles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """SenseVoice 时间轴漂移修正：排序 + 去重叠 + 修正 end<start"""
+    if not subtitles:
+        return subtitles
+    sorted_subs = sorted(subtitles, key=lambda x: float(x.get("start_time", 0) or 0))
+    fixed = []
+    prev_end = 0.0
+    for sub in sorted_subs:
+        start = max(0.0, float(sub.get("start_time", 0) or 0))
+        end = float(sub.get("end_time", start) or start)
+        if end <= start:
+            end = start + max(0.5, len(sub.get("msg", "")) * 0.2)
+        if start < prev_end:
+            start = prev_end
+            if end <= start:
+                end = start + 0.5
+        fixed.append({"msg": sub.get("msg", ""), "start_time": round(start, 3), "end_time": round(end, 3)})
+        prev_end = end
+    return fixed
+
 def _merge_overlapping_subtitles(subtitles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not subtitles:
         return []
@@ -554,6 +634,9 @@ def _create_with_sensevoice(audio_file: str, subtitle_file: str = ""):
         raw_items += 1
         _parse_funasr_result_item(item, subtitles)
 
+    # SenseVoice 专项后处理：漂移修正 + 幻觉过滤
+    subtitles = [s for s in subtitles if not _is_hallucination(s.get("msg", ""))]
+    subtitles = _fix_sensevoice_drift(subtitles)
     subtitles = _merge_overlapping_subtitles(subtitles)
 
     end = timer()
@@ -593,12 +676,19 @@ def _create_with_faster_whisper(audio_file: str, subtitle_file: str = ""):
         audio=audio_file,
         beam_size=max(1, DEFAULT_BEAM_SIZE),
         best_of=max(1, DEFAULT_BEST_OF),
-        word_timestamps=False,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=DEFAULT_VAD_MIN_SILENCE_MS),
-        condition_on_previous_text=True,
+        word_timestamps=True,          # 启用词级时间戳，提升对齐精度
+        vad_filter=True,               # VAD 过滤静音
+        vad_parameters=dict(
+            min_silence_duration_ms=DEFAULT_VAD_MIN_SILENCE_MS,
+            speech_pad_ms=200,         # 语音前后各留 200ms 缓冲
+            threshold=0.35,            # 降低 VAD 阈值，减少漏检
+        ),
+        condition_on_previous_text=False,  # 关闭上下文条件，减少幻觉
         temperature=0.0,
+        compression_ratio_threshold=2.4,
+        no_speech_threshold=0.6,
         initial_prompt=DEFAULT_INITIAL_PROMPT,
+        hallucination_silence_threshold=2.0,  # 超过2秒静音就截断，防漂移
     )
     if forced_language:
         transcribe_kwargs["language"] = forced_language
@@ -618,12 +708,38 @@ def _create_with_faster_whisper(audio_file: str, subtitle_file: str = ""):
     start = timer()
     subtitles = []
     segment_count = 0
+    prev_end = 0.0
     for segment in segments:
         segment_count += 1
         text = (getattr(segment, "text", "") or "").strip()
         if not text:
             continue
-        _append_subtitle_line(subtitles, text, float(getattr(segment, "start", 0.0) or 0.0), float(getattr(segment, "end", 0.0) or 0.0))
+
+        seg_start = float(getattr(segment, "start", 0.0) or 0.0)
+        seg_end = float(getattr(segment, "end", 0.0) or 0.0)
+
+        # ── 时间轴漂移检测与修正 ─────────────────────────────
+        # 如果当前段开始时间比上一段结束时间早超过 0.1s，修正为上一段结束时间
+        if seg_start < prev_end - 0.1:
+            logger.warning(
+                f"检测到时间轴漂移: segment {segment_count} start={seg_start:.2f} < prev_end={prev_end:.2f}，自动修正"
+            )
+            seg_start = prev_end
+
+        # ── 幻觉过滤 ─────────────────────────────────────────
+        # 过滤 faster-whisper 常见幻觉：重复字符、纯标点、过长重复
+        if _is_hallucination(text):
+            logger.debug(f"过滤幻觉片段: {repr(text[:50])}")
+            continue
+
+        # ── 利用词级时间戳细分长段落 ─────────────────────────
+        words = getattr(segment, "words", None)
+        if words and len(words) > 0:
+            _append_words_as_subtitles(subtitles, words, seg_start, seg_end)
+        else:
+            _append_subtitle_line(subtitles, text, seg_start, seg_end)
+
+        prev_end = seg_end
 
     end = timer()
     logger.info(f"complete, elapsed: {end - start:.2f} s, raw_segments={segment_count}, subtitle_lines={len(subtitles)}")

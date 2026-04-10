@@ -110,10 +110,21 @@ class SegmentRefiner:
             "|".join(INTERNAL_SHIFT_PATTERNS), re.IGNORECASE
         )
 
-    def refine(self, fused_segments: List[FusedSegment]) -> List[RefinedSegment]:
+    def refine(
+        self,
+        fused_segments: List[FusedSegment],
+        narrative_warnings: List[Dict] = None,
+    ) -> List[RefinedSegment]:
         """
         主入口：对融合后的段落做精分和打分。
+
+        narrative_warnings: 来自第一轮 LLM 的雷区标记列表，
+        用于提升对应时间段内段落的歧义评分。
+        对应会话共识：narrative_warnings 在精分段里的应用。
         """
+        # 建立雷区时间段快速查找索引
+        self._warning_ranges = _build_warning_index(narrative_warnings or [])
+
         total = len(fused_segments)
         refined = []
 
@@ -189,7 +200,7 @@ class SegmentRefiner:
         importance = self._score_importance(text, position_ratio)
 
         # ambiguity（1-5）
-        ambiguity = self._score_ambiguity(text)
+        ambiguity = self._score_ambiguity(text, start=seg.start, end=seg.end)
 
         # visual_dependency（1-5）
         visual_dep = self._score_visual_dependency(seg)
@@ -244,10 +255,25 @@ class SegmentRefiner:
             score = max(score, 3)
         return max(1, min(5, score))
 
-    def _score_ambiguity(self, text: str) -> int:
-        if self._ambiguity_re.search(text):
-            return 4
-        return 1
+    def _score_ambiguity(self, text: str, start: float = 0.0, end: float = 0.0) -> int:
+        """
+        歧义度评分。
+        如果段落时间范围内有 narrative_warnings 雷区标记，
+        歧义度至少设为 3（对应文档要求）。
+        """
+        base = 4 if self._ambiguity_re.search(text) else 1
+        # 检查是否命中雷区
+        if hasattr(self, '_warning_ranges') and self._warning_ranges:
+            for w_start, w_end, w_type in self._warning_ranges:
+                # 时间段有重叠
+                if not (end < w_start or start > w_end):
+                    warning_boost = {
+                        "lie": 4, "irony": 4, "omission": 3,
+                        "flashback": 2, "voiceover": 2,
+                    }.get(w_type, 3)
+                    base = max(base, warning_boost)
+                    break
+        return max(1, min(5, base))
 
     def _score_visual_dependency(self, seg: FusedSegment) -> int:
         if seg.visual_only or seg.special_type in ("flashback", "montage"):
@@ -321,9 +347,12 @@ class SegmentRefiner:
 
 # ── 便捷入口 ──────────────────────────────────────────────────
 
-def refine_segments(fused_segments: List[FusedSegment]) -> List[RefinedSegment]:
+def refine_segments(
+    fused_segments: List[FusedSegment],
+    narrative_warnings: List[Dict] = None,
+) -> List[RefinedSegment]:
     """pipeline 调用的入口"""
-    return SegmentRefiner().refine(fused_segments)
+    return SegmentRefiner().refine(fused_segments, narrative_warnings=narrative_warnings)
 
 
 def refined_to_dict(seg: RefinedSegment) -> Dict:
@@ -374,3 +403,42 @@ def _plot_function_to_role(pf: str) -> str:
         "节奏缓冲": "development",
     }
     return mapping.get(pf, "development")
+
+
+# ─────────────────────────────────────────────────────────────
+# narrative_warnings 索引构建
+# ─────────────────────────────────────────────────────────────
+
+def _build_warning_index(narrative_warnings: List[Dict]) -> List[tuple]:
+    """
+    把 narrative_warnings 列表转换为 (start_sec, end_sec, type) 元组列表，
+    用于 O(n) 时间段重叠检查。
+
+    narrative_warnings 格式：
+    [{"time": "00:10:15", "type": "lie", "reason": "..."}]
+    """
+    index = []
+    for w in (narrative_warnings or []):
+        t = _parse_warning_time(w.get("time", ""))
+        if t >= 0:
+            # 雷区窗口：前后各30秒
+            index.append((max(0.0, t - 30), t + 30, w.get("type", "unknown")))
+    return index
+
+
+def _parse_warning_time(t: str) -> float:
+    """把 HH:MM:SS 或秒数字符串解析为秒"""
+    t = str(t or "").strip()
+    if ":" in t:
+        parts = t.split(":")
+        try:
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            if len(parts) == 2:
+                return int(parts[0]) * 60 + float(parts[1])
+        except Exception:
+            pass
+    try:
+        return float(t)
+    except Exception:
+        return -1.0
